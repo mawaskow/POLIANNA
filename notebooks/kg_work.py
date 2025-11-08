@@ -153,42 +153,80 @@ for ind in pol_df.index:
     section_num = deets[7]
     article_num = deets[9]
     # Policy
-    if policy_code not in policies:
+    policy = onto[policy_code]
+    if not policy:
         policy = onto.Policy(policy_code) #unique Policy instance with name of policy_code
         policy.policy_code = [policy_code] #sets the Policy instance's policy_code to the policy_code
         policies[policy_code] = policy #stores the Policy instance in the dictionary
-    else:
-        policy = onto[policy_code]
     # Chapter
     chapter_key = f"{policy_code}_Chapter_{chapter_num}" #makes unique chapter key
-    if chapter_key not in chapters:
+    chapter = onto[chapter_key]
+    if not chapter:
         chapter = onto.Chapter(chapter_key)
         chapter.chapter_num = [chapter_num]
         chapter.isChapterOf.append(policy)
-        policy.hasChapter.append(chapter)
         chapters[chapter_key] = chapter
-    else:
-        chapter = onto[chapter_key]
     # Section
     section_key = f"{policy_code}_Chapter_{chapter_num}_Section_{section_num}"
-    if section_key not in sections:
+    section = onto[section_key]
+    if not section:
         section = onto.Section(section_key)
         section.section_num = [section_num]
         section.isSectionOf.append(chapter)
-        chapter.hasSection.append(section)
         sections[section_key] = section
-    else:
-        section = onto[section_key]
     # Article
     article_key = f"{policy_code}_Chapter_{chapter_num}_Section_{section_num}_Article_{article_num}"
-    if article_key not in articles:
+    article = onto[article_key]
+    if not article:
         article = onto.Article(article_key)
         article.article_num = [article_num]
         article.isArticleOf.append(section)
-        section.hasArticle.append(article)
         articles[article_key] = article
-    else:
-        article = onto[article_key]
+
+no_tag_lst = []
+for ind in pol_df.index:
+    deets = ind.split("_")
+    policy_code = "_".join(deets[:2])
+    #ignore whereas and front bits for now
+    if deets[2] == "Whereas" or deets[2] == "front":
+        continue
+    chapter_num = deets[5]
+    section_num = deets[7]
+    article_num = deets[9]
+    article_key = f"{policy_code}_Chapter_{chapter_num}_Section_{section_num}_Article_{article_num}"
+
+    article = onto[article_key]
+    for spanobj in pol_df.loc[ind, "Curation"]:
+        span_id = f"{article_key}_{spanobj.span_id}"
+        if not spanobj.tag:
+            no_tag_lst.append((ind, spanobj.span_id))
+            continue
+        if spanobj.feature == "Technologyandapplicationspecificity":
+            continue
+        span = onto.Span(span_id+"_span")
+        span.span_id = [span_id]
+        span.span_text = [spanobj.text]
+        # tag
+        tag = onto[spanobj.tag]
+        if not tag:
+            tag = onto.Tag(spanobj.tag)
+            tag.tag_name = [spanobj.tag]
+        # can i assert feature/layer inheritance globally? should i?
+        feature = onto[spanobj.feature]
+        if not feature:
+            feature = onto.Feature(spanobj.feature)
+            feature.feature_name = [spanobj.feature]
+        layer = onto[spanobj.layer]
+        if not layer:
+            layer = onto.Layer(spanobj.layer)
+            layer.layer_name = [spanobj.layer]
+        span.inTag = [tag]
+        tag.inFeature = [feature]
+        feature.inLayer = [layer]
+        #tag.taggedSpan.append(span)
+        span.isSpanOf = [article]
+        #article.hasSpan.append(span)
+    articles[article_key] = article
 
 sync_reasoner(infer_property_values=True)
 onto.save(file=f"{cwd}/auxil/policy_kg_populated.owl", format="rdfxml")
