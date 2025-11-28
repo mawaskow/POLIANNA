@@ -121,6 +121,9 @@ with onto:
     class article_num(DataProperty):
         domain = [Article]
         range = [str]
+    class article_text(DataProperty):
+        domain = [Article]
+        range = [str]
     #spans
     class layer_name(DataProperty):
         domain = [Layer]
@@ -181,6 +184,7 @@ for ind in pol_df.index:
         article = onto.Article(article_key)
         article.article_num = [article_num]
         article.isArticleOf.append(section)
+        article.article_text = [pol_df.loc[ind, "Text"]]
         articles[article_key] = article
 
 no_tag_lst = []
