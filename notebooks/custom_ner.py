@@ -8,11 +8,9 @@ sys.path.insert(0, '..')
 from src.experiment_utils.helper_classes import token, span, repository
 from src.d02_corpus_statistics.corpus import Corpus
 from collections import Counter
-from transformers import pipeline, AutoModel, PreTrainedTokenizerBase
+from transformers import pipeline, AutoModel, AutoConfig, PreTrainedTokenizerBase, PretrainedConfig, PreTrainedModel
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoModelForTokenClassification, TrainingArguments, Trainer
 from transformers.modeling_outputs import TokenClassifierOutput
-import spacy
-from spacy.training import offsets_to_biluo_tags
 from datasets import Dataset, DatasetDict
 import torch
 import torch.nn as nn
@@ -123,27 +121,45 @@ WEIGHTS ={'class_weights': {'Actor': torch.tensor([ 0.3560,  9.8114, 11.2143]),
   'Resource': torch.tensor(2.4931),
   'Time': torch.tensor(1.0659)}}
 
-class DebertaForMultiHeadTokClass(nn.Module):
-    def __init__(self, model_name = 'microsoft/deberta-v3-base'):
-        super().__init__()
-        n_labels = 3
-        # shared encoder
-        self.base_model = AutoModel.from_pretrained(model_name)
+class MultiHeadTokenConfig(PretrainedConfig):
+    model_type = "deberta-multihead"
+    def __init__(
+            self,
+            base_model_name="microsoft/deberta-v3-base",
+            n_labels=3,
+            heads=None,
+            hidden_size=None,
+            id2label=None,
+            label2id=None,
+            **kwargs):
+        super().__init__(**kwargs)
+        self.base_model_name = base_model_name
+        self.n_labels = n_labels
+        self.heads = heads or ["Actor", "InstrumentType", "Objective", "Resource", "Time"]
+        self.hidden_size = hidden_size 
+        self.id2label = id2label or {0: "O", 1: "B", 2: "I"}
+        self.label2id = label2id or {v: k for k, v in self.id2label.items()}
+
+class DebertaForMultiHeadTokClass(PreTrainedModel):
+    config_class = MultiHeadTokenConfig
+    def __init__(self, config):
+        super().__init__(config)
+        self.encoder_config = AutoConfig.from_pretrained(config.base_model_name)
+        self.encoder = AutoModel.from_pretrained(config.base_model_name, config=self.encoder_config)
         hidden_size = self.base_model.config.hidden_size
         #sep linear head for each feature type classification
         self.classifiers = nn.ModuleDict({
-            "Actor": nn.Linear(hidden_size, n_labels),
-            "InstrumentType": nn.Linear(hidden_size, n_labels),
-            "Objective": nn.Linear(hidden_size, n_labels),
-            "Resource": nn.Linear(hidden_size, n_labels),
-            "Time": nn.Linear(hidden_size, n_labels)
+            head: nn.Linear(hidden_size, config.num_labels) for head in config.heads
         })
+        self.dropout = nn.Dropout(config.hidden_dropout_prob if hasattr(config, 'hidden_dropout_prob') else 0.1)
+        self.init_weights()
     def forward(self, input_ids, attention_mask=None, **labels):
         # batch of inputs encoded by base model
-        outputs = self.base_model(input_ids, attention_mask=attention_mask)
+        outputs = self.encoder(input_ids, attention_mask=attention_mask)
         # only uses last hidden state... for now
         # will look into averaging/concatenating last few hidden states
         sequence_output = outputs.last_hidden_state
+        #sequence_output = self.dropout(sequence_output)
         # passes encoded input sequence to each classifier to get logits
         logits = {name: self.classifiers[name](sequence_output) for name in self.classifiers}
         loss = None
@@ -205,11 +221,9 @@ def compute_metrics_multihead(p):
     return metrics
 
 def main():
-    #model_name = "microsoft/deberta-v3-base" # suggested lr of 3e-5
-    #model_name = "dslim/bert-base-NER-uncased"
-    model_name = "FacebookAI/xlm-roberta-base"
+    model_name_list = ["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"]
     mode = "sep"#"all"
-    r_list = [1,2]
+    r_list = [0,1,2]
     #
     cwd = os.getcwd()
     label2id = {"O":0, "B":1, "I":2}
@@ -221,66 +235,77 @@ def main():
         "labels_Resource",
         "labels_Time"
     ]
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    def tokenize_and_align_labels(examples):
-        # adapted for multi-head from https://huggingface.co/docs/transformers/en/tasks/token_classification
-        # even tho the token lists area already split into words, we need to break them into subwords
-        # and then ensure that the label sequences still align in the new token sequence
-        tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True, padding=True, return_attention_mask=True)
-        # for each label type/list
-        for col in label_cols:
-            all_aligned_labels = []
-            # loop through this label type's sequence in each sample and realign
-            for sample_idx, labels in enumerate(examples[col]):
-                word_ids = tokenized_inputs.word_ids(batch_index=sample_idx)
-                # smth like [None, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20]
-                previous_word_idx = None
-                label_ids = []
-                for word_idx in word_ids:
-                    if word_idx is None:
-                        label_ids.append(-100)
-                    elif word_idx != previous_word_idx:
-                        label_ids.append(labels[word_idx])
-                    else:
-                        label_ids.append(-100)
-                    previous_word_idx = word_idx
-                all_aligned_labels.append(label_ids)
-            tokenized_inputs[col] = all_aligned_labels
-        return tokenized_inputs
-    for r in r_list:
-        dataset_dict = DatasetDict.load_from_disk(cwd+f"/inputs/{mode}/dsdct_r{r}")
-        tokenized_dsdct = dataset_dict.map(tokenize_and_align_labels, batched=True)
-        data_collator = MultiHeadDataCollator(tokenizer=tokenizer, label_columns=label_cols, max_length=512)
-        model = DebertaForMultiHeadTokClass(model_name)
-        training_args = TrainingArguments(
-            output_dir=model_name.split("/")[-1],
-            learning_rate=3e-5,
-            per_device_train_batch_size=16,
-            per_device_eval_batch_size=16,
-            num_train_epochs=10,
-            weight_decay=0.01,
-            eval_strategy="epoch",
-            save_strategy="epoch",
-            load_best_model_at_end=True,
-            label_names=label_cols
-        )
-        trainer = MultiHeadTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=tokenized_dsdct["train"],
-            eval_dataset=tokenized_dsdct["dev"],
-            processing_class=tokenizer,
-            data_collator=data_collator,
-            compute_metrics=compute_metrics_multihead
-        )
-        trainer.train()
-        trainer.save_model(cwd+f"/models/{mode}/{model_name.split('/')[-1]}_{r}")
-        del model
-        del trainer
-        #del tokenizer
-        torch.cuda.empty_cache()
-        gc.collect()
-
+    for model_name in model_name_list:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        def tokenize_and_align_labels(examples):
+            # adapted for multi-head from https://huggingface.co/docs/transformers/en/tasks/token_classification
+            # even tho the token lists area already split into words, we need to break them into subwords
+            # and then ensure that the label sequences still align in the new token sequence
+            tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True, padding=True, return_attention_mask=True)
+            # for each label type/list
+            for col in label_cols:
+                all_aligned_labels = []
+                # loop through this label type's sequence in each sample and realign
+                for sample_idx, labels in enumerate(examples[col]):
+                    word_ids = tokenized_inputs.word_ids(batch_index=sample_idx)
+                    # smth like [None, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20]
+                    previous_word_idx = None
+                    label_ids = []
+                    for word_idx in word_ids:
+                        if word_idx is None:
+                            label_ids.append(-100)
+                        elif word_idx != previous_word_idx:
+                            label_ids.append(labels[word_idx])
+                        else:
+                            label_ids.append(-100)
+                        previous_word_idx = word_idx
+                    all_aligned_labels.append(label_ids)
+                tokenized_inputs[col] = all_aligned_labels
+            return tokenized_inputs
+        for r in r_list:
+            dataset_dict = DatasetDict.load_from_disk(cwd+f"/inputs/{mode}/dsdct_r{r}")
+            tokenized_dsdct = dataset_dict.map(tokenize_and_align_labels, batched=True)
+            data_collator = MultiHeadDataCollator(tokenizer=tokenizer, label_columns=label_cols, max_length=512)
+            encoder_config = AutoConfig.from_pretrained(model_name)
+            config = MultiHeadTokenConfig(
+                base_model_name=model_name,
+                num_labels=3,
+                heads=["Actor", "InstrumentType", "Objective", "Resource", "Time"],
+                hidden_size=encoder_config.hidden_size,
+                id2label=id2label,
+                label2id=label2id
+            )
+            model = DebertaForMultiHeadTokClass(config)
+            training_args = TrainingArguments(
+                output_dir=model_name.split("/")[-1],
+                learning_rate=3e-5,
+                per_device_train_batch_size=16,
+                per_device_eval_batch_size=16,
+                num_train_epochs=10,
+                weight_decay=0.01,
+                eval_strategy="epoch",
+                save_strategy="epoch",
+                load_best_model_at_end=True,
+                label_names=label_cols
+            )
+            trainer = MultiHeadTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=tokenized_dsdct["train"],
+                eval_dataset=tokenized_dsdct["dev"],
+                processing_class=tokenizer,
+                data_collator=data_collator,
+                compute_metrics=compute_metrics_multihead
+            )
+            trainer.train()
+            #trainer.save_model(cwd+f"/models/{mode}/{model_name.split('/')[-1]}_{r}")
+            model.save_pretrained(cwd+f"/models/{mode}/{model_name.split('/')[-1]}_{r}")
+            config.save_pretrained(cwd+f"/models/{mode}/{model_name.split('/')[-1]}_{r}")
+            del model
+            del trainer
+            torch.cuda.empty_cache()
+            gc.collect()
+        del tokenizer
 
 if __name__=="__main__":
     main()
