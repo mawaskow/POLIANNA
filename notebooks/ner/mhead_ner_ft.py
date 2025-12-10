@@ -1,12 +1,12 @@
+'''
+A custom token classification model with five separate classifier heads for five separate feature types.
+'''
 import json
 import sys
 import pandas as pd
-import collections 
 import os
 import numpy as np
-sys.path.insert(0, '..')
-from src.experiment_utils.helper_classes import token, span, repository
-from src.d02_corpus_statistics.corpus import Corpus
+sys.path.insert(0, '../..')
 from collections import Counter
 from transformers import pipeline, AutoModel, AutoConfig, PreTrainedTokenizerBase, PretrainedConfig, PreTrainedModel
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoModelForTokenClassification, TrainingArguments, Trainer
@@ -15,12 +15,14 @@ from datasets import Dataset, DatasetDict
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
-import evaluate
 from typing import Any, Dict, List
 from sklearn.metrics import f1_score
 import subprocess
-import math
 import gc
+
+#########################
+# classes and functions #
+#########################
 
 class MultiHeadDataCollator:
     '''
@@ -219,6 +221,10 @@ def compute_metrics_multihead(p):
         f1 = f1_score(labels_flat, preds_flat, average='micro')
         metrics[f"{head_name}_f1"] = f1
     return metrics
+
+########
+# main #
+########
 
 def main():
     model_name_list = ["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"]
