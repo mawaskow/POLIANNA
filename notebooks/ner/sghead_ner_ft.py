@@ -15,6 +15,15 @@ import time
 #############
 
 def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r):
+    '''
+    Docstring for finetune_sghead_model
+    
+    :param model_name: name of hf model to be used as tokenizer and base model for fine-tuning
+    :param label_list: list of labels in order (for conversion between BIO tags in the classes and ints)
+    :param model_save_addr: directory address where to save the model directories
+    :param dsdct_dir: directory address (sghead_dsdcts) where the datasetdictionary directories (dsdct_r{#}) are stored
+    :param r: which # run
+    '''
     # initialize tokenization of dataset
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     def tokenize_and_align_labels(examples):
@@ -112,10 +121,13 @@ def main():
     with open(cwd+"/../inputs/sghead_ds/label_mapping.json", "r", encoding="utf-8") as f:
         label_list = json.load(f)
     ########### one-off ###########
-    #model_name = "microsoft/deberta-v3-base"
-    #r = 3
-    #finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r)
+    '''
+    model_name = "microsoft/deberta-v3-base"
+    r = 3
+    finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r)
+    '''
     ########### loop mode ###########
+
     st = time.time()
     for model_name in ["microsoft/deberta-v3-base"]:
         md_st = time.time()
@@ -135,6 +147,7 @@ def main():
             time.sleep(2)
         print(f"\nAll r's of {model_name} done in {round((time.time()-md_st)/60,2)} min")
     print(f'\nAll models and runs done in {round((time.time()-st)/60,2)} min')
+    ''''''
 
 if __name__=="__main__":
     main()

@@ -1,7 +1,6 @@
 '''
-For use in subprocess to train the models in loops without memory leakage between runs
+For use in subprocess to train the sghead models in loops without memory leakage between runs
 '''
-# oneft.py
 import os, json, sys, time, gc
 import torch
 from sghead_ner_ft import finetune_sghead_model

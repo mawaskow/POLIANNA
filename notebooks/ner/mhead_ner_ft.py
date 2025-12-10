@@ -1,17 +1,13 @@
 '''
 A custom token classification model with five separate classifier heads for five separate feature types.
 '''
-import json
-import sys
-import pandas as pd
 import os
 import numpy as np
-sys.path.insert(0, '../..')
 from collections import Counter
-from transformers import pipeline, AutoModel, AutoConfig, PreTrainedTokenizerBase, PretrainedConfig, PreTrainedModel
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoModelForTokenClassification, TrainingArguments, Trainer
+from transformers import AutoModel, AutoConfig, PreTrainedTokenizerBase, PretrainedConfig, PreTrainedModel
+from transformers import AutoTokenizer, TrainingArguments, Trainer
 from transformers.modeling_outputs import TokenClassifierOutput
-from datasets import Dataset, DatasetDict
+from datasets import DatasetDict
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
@@ -19,6 +15,7 @@ from typing import Any, Dict, List
 from sklearn.metrics import f1_score
 import subprocess
 import gc
+import time
 
 #########################
 # classes and functions #
@@ -26,6 +23,7 @@ import gc
 
 class MultiHeadDataCollator:
     '''
+    Docstring for MultiHeadDataCollator
     Using PreTrainedTokenizerBase i.e. whatever pretrained tokenizer we have from tokenize_and_align_labels
     And using pad_sequence
     '''
@@ -63,6 +61,12 @@ class MultiHeadDataCollator:
         return batch
 
 def get_weights(label_cols, tokenized_dsdct):
+    '''
+    Docstring for get_weights
+    
+    :param label_cols: Description
+    :param tokenized_dsdct: Description
+    '''
     # lets create class (BIO) weights for each feature type
     num_classes = 3
     class_weights = {}
@@ -205,6 +209,11 @@ class MultiHeadTrainer(Trainer):
         return loss
 
 def compute_metrics_multihead(p):
+    '''
+    Docstring for compute_metrics_multihead
+    
+    :param p: Description
+    '''
     prediction_dct, label_dct = p
     lblnames = [i[0] for i in prediction_dct.items()]
     metrics = {}
@@ -222,16 +231,16 @@ def compute_metrics_multihead(p):
         metrics[f"{head_name}_f1"] = f1
     return metrics
 
-########
-# main #
-########
-
-def main():
-    model_name_list = ["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"]
-    mode = "sep"#"all"
-    r_list = [0,1,2]
-    #
-    cwd = os.getcwd()
+def finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r):
+    '''
+    Docstring for finetune_mhead_model
+    
+    :param model_name: name of hf model to be used as tokenizer and base model for fine-tuning
+    :param model_save_addr: directory address where to save the model directories
+    :param dsdct_dir: directory address (mhead_dsdcts) where the datasetdictionary directories (dsdct_r{#}) are stored
+    :param r: which # run
+    '''
+    # initialize labels and label fields in the dataset
     label2id = {"O":0, "B":1, "I":2}
     id2label = {0:"O", 1:"B", 2:"I"}
     label_cols = [
@@ -241,102 +250,115 @@ def main():
         "labels_Resource",
         "labels_Time"
     ]
-    for model_name in model_name_list:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        def tokenize_and_align_labels(examples):
-            # adapted for multi-head from https://huggingface.co/docs/transformers/en/tasks/token_classification
-            # even tho the token lists area already split into words, we need to break them into subwords
-            # and then ensure that the label sequences still align in the new token sequence
-            tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True, padding=True, return_attention_mask=True)
-            # for each label type/list
-            for col in label_cols:
-                all_aligned_labels = []
-                # loop through this label type's sequence in each sample and realign
-                for sample_idx, labels in enumerate(examples[col]):
-                    word_ids = tokenized_inputs.word_ids(batch_index=sample_idx)
-                    # smth like [None, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20]
-                    previous_word_idx = None
-                    label_ids = []
-                    for word_idx in word_ids:
-                        if word_idx is None:
-                            label_ids.append(-100)
-                        elif word_idx != previous_word_idx:
-                            label_ids.append(labels[word_idx])
-                        else:
-                            label_ids.append(-100)
-                        previous_word_idx = word_idx
-                    all_aligned_labels.append(label_ids)
-                tokenized_inputs[col] = all_aligned_labels
-            return tokenized_inputs
-        for r in r_list:
-            dataset_dict = DatasetDict.load_from_disk(cwd+f"/inputs/{mode}/dsdct_r{r}")
-            tokenized_dsdct = dataset_dict.map(tokenize_and_align_labels, batched=True)
-            data_collator = MultiHeadDataCollator(tokenizer=tokenizer, label_columns=label_cols, max_length=512)
-            encoder_config = AutoConfig.from_pretrained(model_name)
-            config = MultiHeadTokenConfig(
-                base_model_name=model_name,
-                num_labels=3,
-                heads=["Actor", "InstrumentType", "Objective", "Resource", "Time"],
-                hidden_size=encoder_config.hidden_size,
-                id2label=id2label,
-                label2id=label2id
-            )
-            model = DebertaForMultiHeadTokClass(config)
-            training_args = TrainingArguments(
-                output_dir=model_name.split("/")[-1],
-                learning_rate=3e-5,
-                per_device_train_batch_size=16,
-                per_device_eval_batch_size=16,
-                num_train_epochs=10,
-                weight_decay=0.01,
-                eval_strategy="epoch",
-                save_strategy="epoch",
-                load_best_model_at_end=True,
-                label_names=label_cols
-            )
-            trainer = MultiHeadTrainer(
-                model=model,
-                args=training_args,
-                train_dataset=tokenized_dsdct["train"],
-                eval_dataset=tokenized_dsdct["dev"],
-                processing_class=tokenizer,
-                data_collator=data_collator,
-                compute_metrics=compute_metrics_multihead
-            )
-            trainer.train()
-            #trainer.save_model(cwd+f"/models/{mode}/{model_name.split('/')[-1]}_{r}")
-            model.save_pretrained(cwd+f"/models/{mode}/{model_name.split('/')[-1]}_{r}")
-            config.save_pretrained(cwd+f"/models/{mode}/{model_name.split('/')[-1]}_{r}")
-            del model
-            del trainer
-            torch.cuda.empty_cache()
-            gc.collect()
-        del tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    def tokenize_and_align_labels(examples):
+        # adapted for multi-head from https://huggingface.co/docs/transformers/en/tasks/token_classification
+        # even tho the token lists area already split into words, we need to break them into subwords
+        # and then ensure that the label sequences still align in the new token sequence
+        tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True, padding=True, return_attention_mask=True)
+        # for each label type/list
+        for col in label_cols:
+            all_aligned_labels = []
+            # loop through this label type's sequence in each sample and realign
+            for sample_idx, labels in enumerate(examples[col]):
+                word_ids = tokenized_inputs.word_ids(batch_index=sample_idx)
+                # smth like [None, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20]
+                previous_word_idx = None
+                label_ids = []
+                for word_idx in word_ids:
+                    if word_idx is None:
+                        label_ids.append(-100)
+                    elif word_idx != previous_word_idx:
+                        label_ids.append(labels[word_idx])
+                    else:
+                        label_ids.append(-100)
+                    previous_word_idx = word_idx
+                all_aligned_labels.append(label_ids)
+            tokenized_inputs[col] = all_aligned_labels
+        return tokenized_inputs
+    # load and tokenize datasetdict
+    dataset_dict = DatasetDict.load_from_disk(f"{dsdct_dir}/dsdct_r{r}")
+    tokenized_dsdct = dataset_dict.map(tokenize_and_align_labels, batched=True)
+    data_collator = MultiHeadDataCollator(tokenizer=tokenizer, label_columns=label_cols, max_length=512)
+    # initialize config so we can use from_pretrained to load our models in the eval stage
+    encoder_config = AutoConfig.from_pretrained(model_name)
+    config = MultiHeadTokenConfig(
+        base_model_name=model_name,
+        num_labels=3,
+        heads=["Actor", "InstrumentType", "Objective", "Resource", "Time"],
+        hidden_size=encoder_config.hidden_size,
+        id2label=id2label,
+        label2id=label2id
+    )
+    model = DebertaForMultiHeadTokClass(config)
+    training_args = TrainingArguments(
+        output_dir=model_name.split("/")[-1],
+        learning_rate=3e-5,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
+        num_train_epochs=10,
+        weight_decay=0.01,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        label_names=label_cols
+    )
+    trainer = MultiHeadTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_dsdct["train"],
+        eval_dataset=tokenized_dsdct["dev"],
+        processing_class=tokenizer,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics_multihead
+    )
+    # train
+    trainer.train()
+    #trainer.save_model(cwd+f"/models/{mode}/{model_name.split('/')[-1]}_{r}")
+    model.save_pretrained(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}")
+    config.save_pretrained(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}")
+    del model
+    del trainer
+    del tokenizer
+    torch.cuda.empty_cache()
+    gc.collect()
+
+########
+# main #
+########
+
+def main():
+    cwd = os.getcwd()
+    model_save_addr = cwd+"/../models/mhead"
+    dsdct_dir = cwd+"/../inputs/mhead_dsdcts"
+    ########### one-off ###########
+    '''
+    model_name = "microsoft/deberta-v3-base"
+    r = 3
+    finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r)
+    '''
+    ########### loop mode ###########
+    
+    st = time.time()
+    for model_name in ["microsoft/deberta-v3-base"]:
+        md_st = time.time()
+        for r in [3]:
+            print(f"\n--- Starting run {model_name} r{r} ---")
+            run_st = time.time()
+            subprocess.run([
+                "python", "train_mhead.py",
+                model_name,
+                str(r),
+                model_save_addr,
+                dsdct_dir
+            ],
+                check=True, capture_output=True, text=True)
+            print(f"\n--- Finished run {model_name} r{r} ---")
+            print(f'\nRun done in {round((time.time()-run_st)/60,2)} min')
+            time.sleep(2)
+        print(f"\nAll r's of {model_name} done in {round((time.time()-md_st)/60,2)} min")
+    print(f'\nAll models and runs done in {round((time.time()-st)/60,2)} min')
+    ''''''
 
 if __name__=="__main__":
     main()
-    '''
-    while not torch.cuda.is_available():
-        print("Cuda unavailable")
-        time.sleep(3)
-    print("\nCuda freed!")
-    st = time.time()
-    print(f"\n--- Starting {mode} run ---")
-    print("Start", torch.cuda.memory_allocated())
-    modeldir = os.path.join(output_dir, f"final_{mode}_model")
-    os.makedirs(modeldir, exist_ok=True)
-
-    subprocess.run([
-        "python", "train_model.py",
-        str(9),
-        mode,
-        input_dir,
-        modeldir,
-        "os" if mode=="mc" else "default"
-    ],
-        check=True, capture_output=True, text=True)
-    print(f"\n--- Finished {mode} run ---")
-    print(f'\nDone in {round((time.time()-st)/60,2)} min')
-    print("End", torch.cuda.memory_allocated())
-    time.sleep(2)
-    '''
