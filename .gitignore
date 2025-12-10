@@ -133,3 +133,4 @@ dmypy.json
 # new
 notebooks/models
 notebooks/inputs
+notebooks/results
