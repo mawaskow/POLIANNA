@@ -14,6 +14,26 @@ import time
 # functions #
 #############
 
+def sghead_tokenize_and_align_labels(examples, tokenizer):
+    # adapted from https://huggingface.co/docs/transformers/en/tasks/token_classification
+    tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True)
+    labels = []
+    for i, label in enumerate(examples[f"ner_tags"]):
+        word_ids = tokenized_inputs.word_ids(batch_index=i)  # Map tokens to their respective word.
+        previous_word_idx = None
+        label_ids = []
+        for word_idx in word_ids:  # Set the special tokens to -100.
+            if word_idx is None:
+                label_ids.append(-100)
+            elif word_idx != previous_word_idx:  # Only label the first token of a given word.
+                label_ids.append(label[word_idx])
+            else:
+                label_ids.append(-100)
+            previous_word_idx = word_idx
+        labels.append(label_ids)
+    tokenized_inputs["labels"] = labels
+    return tokenized_inputs
+
 def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r):
     '''
     Docstring for finetune_sghead_model
@@ -26,28 +46,9 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r)
     '''
     # initialize tokenization of dataset
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    def tokenize_and_align_labels(examples):
-        # fxn from https://huggingface.co/docs/transformers/en/tasks/token_classification
-        tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True)
-        labels = []
-        for i, label in enumerate(examples[f"ner_tags"]):
-            word_ids = tokenized_inputs.word_ids(batch_index=i)  # Map tokens to their respective word.
-            previous_word_idx = None
-            label_ids = []
-            for word_idx in word_ids:  # Set the special tokens to -100.
-                if word_idx is None:
-                    label_ids.append(-100)
-                elif word_idx != previous_word_idx:  # Only label the first token of a given word.
-                    label_ids.append(label[word_idx])
-                else:
-                    label_ids.append(-100)
-                previous_word_idx = word_idx
-            labels.append(label_ids)
-        tokenized_inputs["labels"] = labels
-        return tokenized_inputs
     # tokenize dataset and initialize data collator
     dataset_dict = DatasetDict.load_from_disk(f"{dsdct_dir}/dsdct_r{r}")
-    tokenized_dsdct = dataset_dict.map(tokenize_and_align_labels, batched=True)
+    tokenized_dsdct = dataset_dict.map(sghead_tokenize_and_align_labels, fn_kwargs={"tokenizer": tokenizer}, batched=True)
     data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
     # get labels
     label2id = {l: i for i, l in enumerate(label_list)}
@@ -127,9 +128,9 @@ def main():
     finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r)
     '''
     ########### loop mode ###########
-
+    
     st = time.time()
-    for model_name in ["microsoft/deberta-v3-base"]:
+    for model_name in ["FacebookAI/xlm-roberta-base"]:
         md_st = time.time()
         for r in [3]:
             print(f"\n--- Starting run {model_name} r{r} ---")

@@ -13,6 +13,7 @@ import json
 from transformers import DataCollatorForTokenClassification
 from torch.utils.data import DataLoader
 import pandas as pd
+from sghead_ner_ft import sghead_tokenize_and_align_labels
 
 #############
 # functions #
@@ -21,63 +22,60 @@ import pandas as pd
 ############################## SGHEAD SEQEVAL ##############################
 
 def sghead_getpreds(model_name, label_list, model_save_addr, dsdct_dir, r):
+    '''
+    Helper function for get_sghead_seqeval
+    Uses a saved finetuned model to make predictions on the test split of the datasetdict used to train it
+    Returns predictions, real labels, and (for error checking) token_ids
+    
+    :param model_name: name of base model (huggingface name)
+    :param label_list: list of bio labels in integer order
+    :param model_save_addr: address to the directory where the models are saved
+    :param dsdct_dir: address to the directory where the datasetsdicts are saved
+    :param r: which r to use for dataset and model retrieval
+    '''
     device = torch.device("cuda")
     dataset_dict = DatasetDict.load_from_disk(f"{dsdct_dir}/dsdct_r{r}")
     model_tt = AutoModelForTokenClassification.from_pretrained(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}").to(device)
-    ############################################
-    # initialize tokenization of dataset
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    def tokenize_and_align_labels(examples):
-        # fxn from https://huggingface.co/docs/transformers/en/tasks/token_classification
-        tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True)
-        labels = []
-        for i, label in enumerate(examples[f"ner_tags"]):
-            word_ids = tokenized_inputs.word_ids(batch_index=i)  # Map tokens to their respective word.
-            previous_word_idx = None
-            label_ids = []
-            for word_idx in word_ids:  # Set the special tokens to -100.
-                if word_idx is None:
-                    label_ids.append(-100)
-                elif word_idx != previous_word_idx:  # Only label the first token of a given word.
-                    label_ids.append(label[word_idx])
-                else:
-                    label_ids.append(-100)
-                previous_word_idx = word_idx
-            labels.append(label_ids)
-        tokenized_inputs["labels"] = labels
-        return tokenized_inputs
-    tokenized_test = dataset_dict["test"].map(tokenize_and_align_labels, batched=True)
+    tokenized_test = dataset_dict["test"].map(sghead_tokenize_and_align_labels, fn_kwargs={"tokenizer": tokenizer}, batched=True)
+    # setting now before torch conversion, saving for later
     all_inputids = [tokenized_test["input_ids"][i] for i in range(len(tokenized_test["input_ids"]))]
     tokenized_test.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    # set up data collator to work with dataloader in padding inputs to uniform size
     data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
     dataloader = DataLoader(tokenized_test, batch_size=16, collate_fn=data_collator, shuffle=False)
     all_preds = []
     all_labels = []
-    model_tt.eval()
-    with torch.no_grad():
+    model_tt.eval() # disable dropout bc we're just doing inference
+    with torch.no_grad(): # also bc we're just doing inference
         for batch in dataloader:
             # collator returns tensors already padded to max in batch
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch.get("labels")
-            if labels is not None:
-                labels = labels.to(device)
+            # get predictions
             outputs = model_tt(input_ids=input_ids, attention_mask=attention_mask)
             logits = outputs.logits
             preds = torch.argmax(logits, dim=-1)
-            for pred_row, label_row in zip(preds.cpu().tolist(), (labels.cpu().tolist() if labels is not None else [None]*preds.size(0))):
-                if label_row is None:
-                    all_preds.append([label_list[p] for p in pred_row])
-                    all_labels.append(None)
-                else:
-                    tp = [label_list[p] for (p, l) in zip(pred_row, label_row) if l != -100]
-                    tl = [label_list[l] for (p, l) in zip(pred_row, label_row) if l != -100]
-                    all_preds.append(tp)
-                    all_labels.append(tl)
-    #print(len(all_inputids[0]), len(all_preds[0]), len(all_labels[0]))
+            # for item in batch, get list of preds and list of labels
+            for pred_row, label_row in zip(preds.cpu().tolist(), labels.cpu().tolist()):
+                # for (pred,label) in list of preds and labels for that item in batch
+                # if the label says it shouldnt be ignored (-100)
+                # add the pred to the pred list and the label to the label list
+                tp = [label_list[p] for (p, l) in zip(pred_row, label_row) if l != -100]
+                tl = [label_list[l] for (p, l) in zip(pred_row, label_row) if l != -100]
+                all_preds.append(tp)
+                all_labels.append(tl)
     return all_preds, all_labels, all_inputids
 
 def seqeval_for_sghead(predictions, labels):
+    '''
+    Helper function for get_sghead_seqeval
+    Generates results dictionary for provided preds and labels for seqeval on sghead model
+    
+    :param predictions: list of predictions of labels for each test entry
+    :param labels: list of lists of labels for each test entry
+    '''
     seqeval = evaluate.load("seqeval")
     results_dict = {}
     results_dict["Overall"] = {"precision":[], "recall":[], "f1":[], "accuracy":[]}
@@ -94,6 +92,17 @@ def seqeval_for_sghead(predictions, labels):
     return results_dict
 
 def get_sghead_seqeval(model_name, label_list, model_save_addr, dsdct_dir, r, results_dir):
+    '''
+    Loads sghead model to get predictions and labels, then uses seqeval to evaluate results
+    Saves predictions, labels, input_ids to one file, then saves results dict to another
+    
+    :param model_name: name of base model (huggingface name)
+    :param label_list: list of bio labels in integer order
+    :param model_save_addr: address to the directory where the models are saved
+    :param dsdct_dir: address to the directory where the datasetsdicts are saved
+    :param r: which r to use for dataset and model retrieval
+    :param results_dir: directory where to save resutls files
+    '''
     predictions, labels, input_ids = sghead_getpreds(model_name, label_list, model_save_addr, dsdct_dir, r)
     with open(f"{results_dir}/seqeval_{model_name.split('/')[-1]}_{r}_pandr.json", "w", encoding="utf-8") as f:
         json.dump({
@@ -108,6 +117,19 @@ def get_sghead_seqeval(model_name, label_list, model_save_addr, dsdct_dir, r, re
 ############################## Post-processing of results ##############################
 
 def visualize_run_sghead_seqeval_results(mode, eval, model_name, r, results_dir, idas=[0]):
+    '''
+    Currently just for sghead and seqeval
+    For each ida (test set entity integer), for each token in the test set entity,
+    prints the token next to the prediction next to the label
+    For error evaluation
+    
+    :param mode: sghead or mhead
+    :param eval: seqeval or token micro f1
+    :param model_name: huggingface model name
+    :param r: which model run to look at
+    :param results_dir: directory where results files are saved
+    :param idas: list of test set entity integers to examine
+    '''
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     with open(f"{results_dir}/{mode}/{eval}_{model_name.split('/')[-1]}_{r}_pandr.json", "r", encoding="utf-8") as f:
         pandr = json.load(f)
@@ -120,6 +142,13 @@ def visualize_run_sghead_seqeval_results(mode, eval, model_name, r, results_dir,
                 f"R:{pandr['real'][ida][idx]:16}  ")
 
 def consol_sghead_seqeval_results(model_names=["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased"], r_vals=[0,1], results_dir="./"):
+    '''
+    Given the list of model names and r values, reads the results files and consolidates into a single results file
+    
+    :param model_names: list of model names whose results it will examine
+    :param r_vals: list of r values for those model runs which it will examine
+    :param results_dir: directory address where the results files are stored
+    '''
     results_dict = {name:{} for name in model_names}
     for model_name in list(results_dict):
         results_dict[model_name]["Overall"] = {"precision":[], "recall":[], "f1":[], "accuracy":[]}
@@ -141,6 +170,11 @@ def consol_sghead_seqeval_results(model_names=["microsoft/deberta-v3-base", "dsl
     return results_dict
 
 def df_vis_consol_sghead_seqeval(results_dict):
+    '''
+    Given *consolidated* results dictionary, prints in dataframe format
+    
+    :param results_dict: results dictionary passed from consol_sghead_seqeval_results or loaded from file
+    '''
     for m in list(results_dict):
         print(f"\n{m}")
         for res in list(results_dict[m]):
@@ -150,6 +184,11 @@ def df_vis_consol_sghead_seqeval(results_dict):
             print(df)
 
 def shortestvis(results_dict):
+    '''
+    Given *consolidated* results dictionary, prints only the rounded, averaged values across runs
+    
+    :param results_dict: results dictionary passed from consol_sghead_seqeval_results or loaded from file
+    '''
     for m in list(results_dict):
         print(f"\n{m}")
         for res in list(results_dict[m]):
@@ -170,8 +209,9 @@ def main():
     with open(cwd+"/../inputs/sghead_ds/label_mapping.json", "r", encoding="utf-8") as f:
         label_list = json.load(f)
     #
-    #model_name = "microsoft/deberta-v3-base"
-    #r = 3
+    model_name = "FacebookAI/xlm-roberta-base"
+    r = 3
+    get_sghead_seqeval(model_name, label_list, sghead_models_dir, sghead_dsdcts_dir, r, results_dir+"/sghead")
     '''
     for model_name in ["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"]:
         for r in [0,1,2]:
@@ -179,12 +219,13 @@ def main():
             get_sghead_seqeval(model_name, label_list, sghead_models_dir, sghead_dsdcts_dir, r, results_dir+"/sghead")
 
     results_dict = consol_sghead_seqeval_results(model_names=["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"], r_vals=[0,1,2], results_dir=results_dir+"/sghead")
-    '''
+    
     with open(f"{results_dir}/sghead/seqeval_results.json","r", encoding="utf-8") as f:
         results_dict = json.load(f)
     
     #df_vis_consol_sghead_seqeval(results_dict)
     shortestvis(results_dict)
+    '''
     # postprocessing
     #visualize_run_results("sghead", "seqeval", model_name, r, results_dir, [0,2])
 
