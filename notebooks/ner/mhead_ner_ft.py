@@ -23,7 +23,7 @@ import time
 
 class MultiHeadDataCollator:
     '''
-    Docstring for MultiHeadDataCollator
+    New data collator class, making our own since it's less complicated than trying to adapt hf collators
     Using PreTrainedTokenizerBase i.e. whatever pretrained tokenizer we have from tokenize_and_align_labels
     And using pad_sequence
     '''
@@ -62,10 +62,13 @@ class MultiHeadDataCollator:
 
 def get_weights(label_cols, tokenized_dsdct):
     '''
-    Docstring for get_weights
+    Takes the tokenized datasetdict and calcuates inverse frequency weights for 
+    A) the BIO labels in each feature category
+    B) the feature heads based on B and I token counts
     
-    :param label_cols: Description
-    :param tokenized_dsdct: Description
+    :param label_cols: list of label list keys in dataset
+    :param tokenized_dsdct: tokenized datasetdict
+    Returns dictionary of weights
     '''
     # lets create class (BIO) weights for each feature type
     num_classes = 3
@@ -106,6 +109,7 @@ def get_weights(label_cols, tokenized_dsdct):
     head_weights_norm = {head: w[i] for i, head in enumerate(head_weights.keys())}
     return {"class_weights": class_weights, "class_weights_norm": class_weights_norm, "head_weights": head_weights, "head_weights_norm": head_weights_norm}
 
+# this is the output of get_weights(label_cols, tokenized_dsdct) for our original <512tokens dataset
 WEIGHTS ={'class_weights': {'Actor': torch.tensor([ 0.3560,  9.8114, 11.2143]),
   'InstrumentType': torch.tensor([ 0.3483, 16.4053, 14.7887]),
   'Objective': torch.tensor([ 0.3513, 53.5521,  7.4079]),
@@ -128,7 +132,11 @@ WEIGHTS ={'class_weights': {'Actor': torch.tensor([ 0.3560,  9.8114, 11.2143]),
   'Time': torch.tensor(1.0659)}}
 
 class MultiHeadTokenConfig(PretrainedConfig):
-    model_type = "deberta-multihead"
+    '''
+    Apparently if we want to load our custom finetuned model using from_pretrained for inference later
+    then we have to make a special config for it so hf can load it :/
+    '''
+    model_type = "multihead"
     def __init__(
             self,
             base_model_name="microsoft/deberta-v3-base",
@@ -146,13 +154,13 @@ class MultiHeadTokenConfig(PretrainedConfig):
         self.id2label = id2label or {0: "O", 1: "B", 2: "I"}
         self.label2id = label2id or {v: k for k, v in self.id2label.items()}
 
-class DebertaForMultiHeadTokClass(PreTrainedModel):
+class MultiHeadTokClass(PreTrainedModel):
     config_class = MultiHeadTokenConfig
     def __init__(self, config):
         super().__init__(config)
-        self.encoder_config = AutoConfig.from_pretrained(config.base_model_name)
+        self.encoder_config = AutoConfig.from_pretrained(config.base_model_name) # connecting our config info
         self.encoder = AutoModel.from_pretrained(config.base_model_name, config=self.encoder_config)
-        hidden_size = self.base_model.config.hidden_size
+        hidden_size = self.base_model.config.hidden_size # explicitly adding this bc it triggered an error
         #sep linear head for each feature type classification
         self.classifiers = nn.ModuleDict({
             head: nn.Linear(hidden_size, config.num_labels) for head in config.heads
@@ -182,7 +190,6 @@ class DebertaForMultiHeadTokClass(PreTrainedModel):
                     active_logits = logits[name].view(-1, 3)[active_loss]
                     active_labels = label.view(-1)[active_loss]
                     # weighting BIO classes for this feature
-                    #weight = WEIGHTS['class_weights'][name].to(active_logits.device)
                     weight = WEIGHTS['class_weights_norm'][name].to(active_logits.device)
                     loss_fct = nn.CrossEntropyLoss(weight=weight)
                     # computing loss for this head
@@ -191,28 +198,32 @@ class DebertaForMultiHeadTokClass(PreTrainedModel):
                     head_loss *= WEIGHTS['head_weights_norm'][name]
                     # sum loss across heads for single update to train simultaneously
                     loss += head_loss
+        # has to be TokenClassifierOutput or else Trainer doesn't pick up on evaluation loss
         return TokenClassifierOutput(
             loss=loss,
             logits=logits,
         )
 
 class MultiHeadTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Extract labels for each head from the inputs
+    '''
+    Custom trainer that calculates evaluation loss for the mhead model
+    '''
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None): # have to add num_items_in_batch bc it's expected even if it isnt used
+        # extract labels for each head from inputs
         labels = {k: inputs.pop(k) for k in list(inputs.keys()) if k.startswith("labels_")}
-        # Forward pass
+        # forward pass
         outputs = model(**inputs, **labels)
-        # Your model returns TokenClassifierOutput
+        # model returns TokenClassifierOutput
         loss = outputs.loss
-        if return_outputs:
+        if return_outputs: # also added bc even if it isnt used sometimes hf models require it ig? idk
             return loss, outputs
         return loss
 
-def compute_metrics_multihead(p):
+def compute_metrics_mhead(p):
     '''
-    Docstring for compute_metrics_multihead
+    Custom F1 score metrics calculation for mhead model
     
-    :param p: Description
+    :param p: evaluation prediction item contianing predictions and labels
     '''
     prediction_dct, label_dct = p
     lblnames = [i[0] for i in prediction_dct.items()]
@@ -230,6 +241,44 @@ def compute_metrics_multihead(p):
         f1 = f1_score(labels_flat, preds_flat, average='micro')
         metrics[f"{head_name}_f1"] = f1
     return metrics
+
+def mhead_tokenize_and_align_labels(examples, tokenizer):
+    '''
+    adapted for multi-head from https://huggingface.co/docs/transformers/en/tasks/token_classification
+    even tho the token lists area already split into words, we need to break them into subwords
+    and then ensure that the label sequences still align in the new token sequence
+    
+    :param examples: datasetdict
+    :param tokenizer: tokenizer
+    '''
+    label_cols = [
+        "labels_Actor",
+        "labels_InstrumentType",
+        "labels_Objective",
+        "labels_Resource",
+        "labels_Time"
+    ]
+    tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True, padding=True, return_attention_mask=True)
+    # for each label type/list
+    for col in label_cols:
+        all_aligned_labels = []
+        # loop through this label type's sequence in each sample and realign
+        for sample_idx, labels in enumerate(examples[col]):
+            word_ids = tokenized_inputs.word_ids(batch_index=sample_idx)
+            # smth like [None, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20]
+            previous_word_idx = None
+            label_ids = []
+            for word_idx in word_ids:
+                if word_idx is None:
+                    label_ids.append(-100)
+                elif word_idx != previous_word_idx:
+                    label_ids.append(labels[word_idx])
+                else:
+                    label_ids.append(-100)
+                previous_word_idx = word_idx
+            all_aligned_labels.append(label_ids)
+        tokenized_inputs[col] = all_aligned_labels
+    return tokenized_inputs
 
 def finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r):
     '''
@@ -251,34 +300,9 @@ def finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r):
         "labels_Time"
     ]
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    def tokenize_and_align_labels(examples):
-        # adapted for multi-head from https://huggingface.co/docs/transformers/en/tasks/token_classification
-        # even tho the token lists area already split into words, we need to break them into subwords
-        # and then ensure that the label sequences still align in the new token sequence
-        tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True, padding=True, return_attention_mask=True)
-        # for each label type/list
-        for col in label_cols:
-            all_aligned_labels = []
-            # loop through this label type's sequence in each sample and realign
-            for sample_idx, labels in enumerate(examples[col]):
-                word_ids = tokenized_inputs.word_ids(batch_index=sample_idx)
-                # smth like [None, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20]
-                previous_word_idx = None
-                label_ids = []
-                for word_idx in word_ids:
-                    if word_idx is None:
-                        label_ids.append(-100)
-                    elif word_idx != previous_word_idx:
-                        label_ids.append(labels[word_idx])
-                    else:
-                        label_ids.append(-100)
-                    previous_word_idx = word_idx
-                all_aligned_labels.append(label_ids)
-            tokenized_inputs[col] = all_aligned_labels
-        return tokenized_inputs
     # load and tokenize datasetdict
     dataset_dict = DatasetDict.load_from_disk(f"{dsdct_dir}/dsdct_r{r}")
-    tokenized_dsdct = dataset_dict.map(tokenize_and_align_labels, batched=True)
+    tokenized_dsdct = dataset_dict.map(mhead_tokenize_and_align_labels, fn_kwargs={"tokenizer": tokenizer}, batched=True)
     data_collator = MultiHeadDataCollator(tokenizer=tokenizer, label_columns=label_cols, max_length=512)
     # initialize config so we can use from_pretrained to load our models in the eval stage
     encoder_config = AutoConfig.from_pretrained(model_name)
@@ -290,7 +314,7 @@ def finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r):
         id2label=id2label,
         label2id=label2id
     )
-    model = DebertaForMultiHeadTokClass(config)
+    model = MultiHeadTokClass(config)
     training_args = TrainingArguments(
         output_dir=model_name.split("/")[-1],
         learning_rate=3e-5,
@@ -310,7 +334,7 @@ def finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r):
         eval_dataset=tokenized_dsdct["dev"],
         processing_class=tokenizer,
         data_collator=data_collator,
-        compute_metrics=compute_metrics_multihead
+        compute_metrics=compute_metrics_mhead
     )
     # train
     trainer.train()
@@ -332,15 +356,15 @@ def main():
     model_save_addr = cwd+"/../models/mhead"
     dsdct_dir = cwd+"/../inputs/mhead_dsdcts"
     ########### one-off ###########
-    '''
-    model_name = "microsoft/deberta-v3-base"
+    ''''''
+    model_name = "FacebookAI/xlm-roberta-base"
     r = 3
     finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r)
-    '''
-    ########### loop mode ###########
     
+    ########### loop mode ###########
+    '''
     st = time.time()
-    for model_name in ["microsoft/deberta-v3-base"]:
+    for model_name in ["FacebookAI/xlm-roberta-base"]:
         md_st = time.time()
         for r in [3]:
             print(f"\n--- Starting run {model_name} r{r} ---")
@@ -358,7 +382,7 @@ def main():
             time.sleep(2)
         print(f"\nAll r's of {model_name} done in {round((time.time()-md_st)/60,2)} min")
     print(f'\nAll models and runs done in {round((time.time()-st)/60,2)} min')
-    ''''''
+    '''
 
 if __name__=="__main__":
     main()
