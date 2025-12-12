@@ -16,6 +16,7 @@ from sklearn.metrics import f1_score
 import subprocess
 import gc
 import time
+import json
 
 #########################
 # classes and functions #
@@ -289,6 +290,7 @@ def finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r):
     :param dsdct_dir: directory address (mhead_dsdcts) where the datasetdictionary directories (dsdct_r{#}) are stored
     :param r: which # run
     '''
+    st = time.time()
     # initialize labels and label fields in the dataset
     label2id = {"O":0, "B":1, "I":2}
     id2label = {0:"O", 1:"B", 2:"I"}
@@ -341,6 +343,16 @@ def finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r):
     #trainer.save_model(cwd+f"/models/{mode}/{model_name.split('/')[-1]}_{r}")
     model.save_pretrained(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}")
     config.save_pretrained(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}")
+    # metrics
+    train_losses = [log["loss"] for log in trainer.state.log_history if "loss" in log]
+    eval_losses = [log["eval_loss"] for log in trainer.state.log_history if "eval_loss" in log]
+    metric_log = []
+    metric_log.append({"train_loss":train_losses})
+    metric_log.append({"eval_loss": eval_losses})
+    metric_log.append({"training_time_min": round((time.time()-st)/60,2)})
+    with open(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}/metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metric_log, f, ensure_ascii=False, indent=4)
+    # cleanup
     del model
     del trainer
     del tokenizer
@@ -356,17 +368,17 @@ def main():
     model_save_addr = cwd+"/../models/mhead"
     dsdct_dir = cwd+"/../inputs/mhead_dsdcts"
     ########### one-off ###########
-    ''''''
+    '''
     model_name = "FacebookAI/xlm-roberta-base"
     r = 3
     finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r)
-    
-    ########### loop mode ###########
     '''
+    ########### loop mode ###########
+    
     st = time.time()
-    for model_name in ["FacebookAI/xlm-roberta-base"]:
+    for model_name in ["microsoft/deberta-v3-base","FacebookAI/xlm-roberta-base","dslim/bert-base-NER-uncased"]:
         md_st = time.time()
-        for r in [3]:
+        for r in [3,4,5]:
             print(f"\n--- Starting run {model_name} r{r} ---")
             run_st = time.time()
             subprocess.run([
@@ -382,7 +394,7 @@ def main():
             time.sleep(2)
         print(f"\nAll r's of {model_name} done in {round((time.time()-md_st)/60,2)} min")
     print(f'\nAll models and runs done in {round((time.time()-st)/60,2)} min')
-    '''
+    ''''''
 
 if __name__=="__main__":
     main()

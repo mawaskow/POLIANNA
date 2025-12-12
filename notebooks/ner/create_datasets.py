@@ -226,10 +226,10 @@ def main():
     mhead_ds_addr = cwd+"/../inputs/mhead_ds"
     #create_mhead_ds(pol_dir, mhead_ds_addr)
     ### splitting
-    #sghead_ds = load_from_disk(sghead_ds_addr)
-    #create_dsdcts(sghead_ds, sghead_ds_addr+"dcts", [3])
-    #mhead_ds = load_from_disk(mhead_ds_addr)
-    #create_dsdcts(mhead_ds, mhead_ds_addr+"dcts", [3])
+    sghead_ds = load_from_disk(sghead_ds_addr)
+    create_dsdcts(sghead_ds, sghead_ds_addr+"dcts", [4,5])
+    mhead_ds = load_from_disk(mhead_ds_addr)
+    create_dsdcts(mhead_ds, mhead_ds_addr+"dcts", [4,5])
     
 
 if __name__=="__main__":

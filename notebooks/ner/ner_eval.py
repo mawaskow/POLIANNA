@@ -475,23 +475,22 @@ def main():
     model_name = "FacebookAI/xlm-roberta-base"
     r = 3
     #get_sghead_seqeval(model_name, label_list, sghead_models_dir, sghead_dsdcts_dir, r, results_dir+"/sghead")
-    #get_mhead_tokf1(model_name, mhead_models_dir, mhead_dsdcts_dir, r, results_dir+"/mhead")
+    get_mhead_tokf1(model_name, mhead_models_dir, mhead_dsdcts_dir, r, results_dir+"/mhead")
     #visualize_run_mhead_tokf1_results("mhead", "tokf1", model_name, r, results_dir, idas=[0,1,2])
-    
+    '''
     for model_name in ["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"]:
-        for r in [0,1,2]:
+        for r in [3,4,5]:#[0,1,2]:
             print(f"\n{model_name} {r}")
             #get_sghead_seqeval(model_name, label_list, sghead_models_dir, sghead_dsdcts_dir, r, results_dir+"/sghead")
-            #get_mhead_tokf1(model_name, mhead_models_dir, mhead_dsdcts_dir, r, results_dir+"/mhead")
-            #consol_mhead_tokf1_results()
-            #get_mhead_seqeval(model_name, r, results_dir+"/mhead")
-    ''''''
-    #results_dict = consol_sghead_seqeval_results(model_names=["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"], r_vals=[0,1,2], results_dir=results_dir+"/sghead")
-    #results_dict = consol_mhead_tokf1_results(model_names=["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"], r_vals=[0,1,2], results_dir=results_dir+"/mhead")
-    results_dict = consol_mhead_seqeval_results(model_names=["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"], r_vals=[0,1,2], results_dir=results_dir+"/mhead")
+            get_mhead_tokf1(model_name, mhead_models_dir, mhead_dsdcts_dir, r, results_dir+"/mhead")
+            get_mhead_seqeval(model_name, r, results_dir+"/mhead")
+    '''
+    #results_dict = consol_sghead_seqeval_results(model_names=["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"], r_vals=[0,1,2,3,4,5], results_dir=results_dir+"/sghead")
+    results_dict = consol_mhead_tokf1_results(model_names=["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"], r_vals=[0,1,2,3,4,5], results_dir=results_dir+"/mhead")
+    #results_dict = consol_mhead_seqeval_results(model_names=["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"], r_vals=[0,1,2], results_dir=results_dir+"/mhead")
     
     #with open(f"{results_dir}/sghead/seqeval_results.json","r", encoding="utf-8") as f:
-    with open(f"{results_dir}/mhead/seqeval_results.json","r", encoding="utf-8") as f:
+    with open(f"{results_dir}/mhead/tokf1_results.json","r", encoding="utf-8") as f:
         results_dict = json.load(f)
     
     #df_vis_consol_sghead_seqeval(results_dict)

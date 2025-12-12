@@ -44,6 +44,7 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r)
     :param dsdct_dir: directory address (sghead_dsdcts) where the datasetdictionary directories (dsdct_r{#}) are stored
     :param r: which # run
     '''
+    st = time.time()
     # initialize tokenization of dataset
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     # tokenize dataset and initialize data collator
@@ -55,6 +56,7 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r)
     id2label = {i: l for i, l in enumerate(label_list)}
     # setup metrics calculation
     seqeval = evaluate.load("seqeval")
+    metric_log = []
     def compute_metrics(p):
         # fxn from https://huggingface.co/docs/transformers/en/tasks/token_classification
         predictions, labels = p
@@ -106,6 +108,15 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r)
     print("Training begin")
     trainer.train()
     trainer.save_model(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}")
+    # metrics
+    train_losses = [log["loss"] for log in trainer.state.log_history if "loss" in log]
+    eval_losses = [log["eval_loss"] for log in trainer.state.log_history if "eval_loss" in log]
+    metric_log.append({"train_loss":train_losses})
+    metric_log.append({"eval_loss": eval_losses})
+    metric_log.append({"training_time_min": round((time.time()-st)/60,2)})
+    with open(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}/metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metric_log, f, ensure_ascii=False, indent=4)
+    # cleanup
     del model
     del trainer
     del tokenizer
@@ -128,11 +139,11 @@ def main():
     finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r)
     '''
     ########### loop mode ###########
-    
+    #["microsoft/deberta-v3-base","FacebookAI/xlm-roberta-base","dslim/bert-base-NER-uncased"]
     st = time.time()
-    for model_name in ["FacebookAI/xlm-roberta-base"]:
+    for model_name in ["dslim/bert-base-NER-uncased"]:
         md_st = time.time()
-        for r in [3]:
+        for r in [3,4,5]:
             print(f"\n--- Starting run {model_name} r{r} ---")
             run_st = time.time()
             subprocess.run([
