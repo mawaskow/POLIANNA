@@ -18,22 +18,6 @@ import gc
 # functions #
 #############
 
-def sghead_tokenize_and_align_labels(tokens, ner_tags, tokenizer, label2id, max_length=512):
-    tokenized_inputs = tokenizer(tokens, truncation=True, is_split_into_words=True, max_length=max_length, return_tensors=None)
-    word_ids = tokenized_inputs.word_ids()
-    previous_word_idx = None
-    label_ids = []
-    for word_idx in word_ids:
-        if word_idx is None:
-            label_ids.append(-100)
-        elif word_idx != previous_word_idx:
-            label_ids.append(label2id[ner_tags[word_idx]])
-        else:
-            label_ids.append(-100)
-        previous_word_idx = word_idx
-    tokenized_inputs["labels"] = label_ids
-    return tokenized_inputs
-
 class SgheadDataset(Dataset):
     def __init__(self, hf_dataset, tokenizer, label2id, max_length=512):
         self.dataset = hf_dataset
@@ -42,24 +26,36 @@ class SgheadDataset(Dataset):
         self.max_length = max_length
     def __len__(self):
         return len(self.dataset)
+    def tokenize_and_align_labels(self, tokens, ner_tags):
+        tokenized_inputs = self.tokenizer(tokens, truncation=True, is_split_into_words=True, max_length=self.max_length, return_tensors=None)
+        word_ids = tokenized_inputs.word_ids()
+        previous_word_idx = None
+        label_ids = []
+        for word_idx in word_ids:
+            if word_idx is None:
+                label_ids.append(-100)
+            elif word_idx != previous_word_idx:
+                label_ids.append(self.label2id[ner_tags[word_idx]])
+            else:
+                label_ids.append(-100)
+            previous_word_idx = word_idx
+        tokenized_inputs["labels"] = label_ids
+        return tokenized_inputs
     def __getitem__(self, idx):
         sample = self.dataset[idx]
         tokens = sample["tokens"]
         ner_tags = sample["ner_tags"]
-        encoding = sghead_tokenize_and_align_labels(
-            tokens,
-            ner_tags,
-            self.tokenizer,
-            self.label2id,
-            self.max_length
-        )
+        encoded = self.tokenize_and_align_labels(tokens, ner_tags)
         return {
-            "input_ids": torch.tensor(encoding["input_ids"]),
-            "attention_mask": torch.tensor(encoding["attention_mask"]),
-            "labels": torch.tensor(encoding["labels"])
+            "input_ids": torch.tensor(encoded["input_ids"]),
+            "attention_mask": torch.tensor(encoded["attention_mask"]),
+            "labels": torch.tensor(encoded["labels"])
         }
 
 def sghead_collate(batch, pad_token_id):
+    '''
+    Collate function for our pytorch DataLoader
+    '''
     input_ids = [b["input_ids"] for b in batch]
     attention_masks = [b["attention_mask"] for b in batch]
     labels = [b["labels"] for b in batch]
@@ -73,6 +69,17 @@ def sghead_collate(batch, pad_token_id):
     }
 
 def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r, params = None):
+    '''
+    Docstring for finetune_sghead_model
+    
+    :param model_name: model to finetune
+    :param label_list: list of labels
+    :param model_save_addr: where to save model
+    :param dsdct_dir: location of datasetdicts
+    :param r: which dataset split dict to use
+    :param params: hyperparameter dict including num_epochs, lr, weight_decay, and batch_size
+    '''
+    st = time.time()
     if not params:
         params = {
             "num_epochs": 10,
@@ -80,12 +87,14 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
             "weight_decay": 0.01,
             "batch_size":16
         }
+    label2id = {l: i for i, l in enumerate(label_list)}
+    id2label = {i: l for i, l in enumerate(label_list)}
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     dataset_dict = DatasetDict.load_from_disk(f"{dsdct_dir}/dsdct_r{r}")
-    train_dataset = SgheadDataset(dataset_dict["train"], tokenizer)
-    dev_dataset = SgheadDataset(dataset_dict["dev"], tokenizer)
+    train_dataset = SgheadDataset(dataset_dict["train"], tokenizer, label2id)
+    dev_dataset = SgheadDataset(dataset_dict["dev"], tokenizer, label2id)
     train_loader = DataLoader(
         train_dataset,
         batch_size=params["batch_size"],
@@ -99,8 +108,6 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
         collate_fn=lambda b: sghead_collate(b, tokenizer.pad_token_id)
     )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    label2id = {l: i for i, l in enumerate(label_list)}
-    id2label = {i: l for i, l in enumerate(label_list)}
     model = AutoModelForTokenClassification.from_pretrained(
         model_name,
         num_labels=len(label_list),
@@ -136,8 +143,7 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
         all_labels = []
         with torch.no_grad():
             for batch in dataloader:
-                labels = batch["labels"]
-                batch = {k: v.to(dev) for k, v in batch.items()}
+                labels = batch["labels"].cpu().numpy()
                 outputs = model(**batch)
                 logits = outputs.logits
                 predictions = torch.argmax(logits, dim=-1).cpu().numpy()
@@ -156,8 +162,12 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
     save_path = f"{model_save_addr}/{model_name.split('/')[-1]}_{r}"
     model.save_pretrained(save_path)
     tokenizer.save_pretrained(save_path)
-    with open(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}/metrics.json", "w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False, indent=4)
+    metrics['time_min'] = round((time.time()-st)/60,2)
+    print(metrics)
+    with open(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}/params.json", "w", encoding="utf-8") as f:
+        json.dump(params, f, ensure_ascii=False, indent=4)
+    #with open(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}/metrics.json", "w", encoding="utf-8") as f:
+    #    json.dump(metrics, f, ensure_ascii=False, indent=4)
     # cleanup
     del model
     del tokenizer
@@ -177,7 +187,13 @@ def main():
     
     model_name = "microsoft/deberta-v3-base"
     r = 0
-    finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r)
+    params = {
+            "num_epochs": 10,
+            "lr": 3e-5,
+            "weight_decay": 0.01,
+            "batch_size":16
+        }
+    finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r, params)
     ''''''
     '''
     ########### loop mode ###########
