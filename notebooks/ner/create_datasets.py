@@ -11,6 +11,7 @@ import sys
 import pandas as pd
 import os
 from datasets import Dataset, DatasetDict, load_from_disk
+from torch.utils.data import Dataset as TorchDataset
 sys.path.insert(0, '../..') # ensures access to src module
 
 #############
@@ -28,7 +29,7 @@ def df_loading(pol_dir, col_sel=["Policy","Text","Tokens","Curation"]):
 
 ################################ SGHEAD ################################
 
-def extract_sghead_labels(df):
+def extract_sghead_label_set(df):
     '''
     Helper function for df_to_sghead_ds(df)
     Function that basically just generates a label list that'll stay the same for any sghead run
@@ -49,7 +50,7 @@ def extract_sghead_labels(df):
         bio_labels.append(f"I-{l}")
     return bio_labels
 
-def span_to_sghead_lbls(tokens, spans, label2id):
+def span_to_sghead_lbls(tokens, spans):
     '''
     Helper function for df_to_sghead_ds(df)
     For an article in the polianna dataframe, takes the list of token objects and the list of span objects
@@ -78,7 +79,7 @@ def span_to_sghead_lbls(tokens, spans, label2id):
                         token_labels[inside_tokens[0]] = f"B-{ftr}"
                         for i in inside_tokens[1:]:
                             token_labels[i] = f"I-{ftr}"
-    return [label2id[l] for l in token_labels]
+    return token_labels
 
 def df_to_sghead_ds(df):
     '''
@@ -87,26 +88,22 @@ def df_to_sghead_ds(df):
     
     :param df: POLIANNA dataframe
     '''
-    dataset = {
-        "id":[],
-        "text":[],
-        "tokens":[],
-        "ner_tags":[]
-    }
-    label_list = extract_sghead_labels(df)
-    label2id = {l: i for i, l in enumerate(label_list)}
+    datapoints = []
     for artid in df.index:
         tokens = df.loc[artid,"Tokens"]
         if len(tokens) <= 512: # we'll change this eventually
             text = df.loc[artid,"Text"]
             spans = df.loc[artid,"Curation"]
             token_texts = [t.text for t in tokens]
-            token_level_labels = span_to_sghead_lbls(tokens, spans, label2id)
-            dataset['id'].append(artid)
-            dataset["text"].append(text)
-            dataset["tokens"].append(token_texts)
-            dataset["ner_tags"].append(token_level_labels)
-    return Dataset.from_dict(dataset), label_list
+            token_level_labels = span_to_sghead_lbls(tokens, spans)
+            datapoints.append({
+                "id": artid,
+                "text": text,
+                "tokens": token_texts,
+                "ner_tags": token_level_labels
+            })
+    # return pd.DataFrame(datapoints)
+    return Dataset.from_list(datapoints)
 
 def create_sghead_ds(pol_dir, dir_addr):
     '''
@@ -117,15 +114,13 @@ def create_sghead_ds(pol_dir, dir_addr):
     :param dir_addr: directory where to save dataset
     '''
     pol_df = df_loading(pol_dir)
-    ds, ll = df_to_sghead_ds(pol_df)
+    ds = df_to_sghead_ds(pol_df)
     ds.save_to_disk(dir_addr)
-    with open(f"{dir_addr}/label_mapping.json", "w", encoding="utf-8") as f:
-        json.dump(ll, f, indent=4)
     print(f"Created dataset in {dir_addr}")
 
 ################################ MHEAD ################################
 
-def span_to_mhead_lbls(feature_name, tokens, spans, label2id):
+def span_to_mhead_lbls(feature_name, tokens, spans):
     '''
     Helper function to df_to_mhead_dataset(df)
     For an article in the dataframe, for a specific feature type in the annotated spans,
@@ -152,7 +147,7 @@ def span_to_mhead_lbls(feature_name, tokens, spans, label2id):
                 token_labels[inside_tokens[0]] = f"B"
                 for i in inside_tokens[1:]:
                     token_labels[i] = f"I"
-    return [label2id[l] for l in token_labels]
+    return token_labels
 
 def df_to_mhead_ds(df):
     '''
@@ -161,32 +156,23 @@ def df_to_mhead_ds(df):
     
     :param df: POLIANNA dataframe
     '''
-    label2id = {
-        "O":0, "B":1, "I":2
-    }
-    dataset = {
-        "id":[],
-        "text":[],
-        "tokens":[],
-        "labels_Actor":[],
-        "labels_InstrumentType":[],
-        "labels_Objective":[],
-        "labels_Resource":[],
-        "labels_Time":[]
-    }
+    datapoints = []
     for artid in df.index:
         tokens = df.loc[artid,"Tokens"]
         if len(tokens) <= 512: # we'll change this eventually
             text = df.loc[artid,"Text"]
             spans = df.loc[artid,"Curation"]
             token_texts = [t.text for t in tokens]
-            dataset['id'].append(artid)
-            dataset["text"].append(text)
-            dataset["tokens"].append(token_texts)
+            datapoint = {}
+            datapoint['id'] = artid
+            datapoint["text"] = text
+            datapoint["tokens"] = token_texts
             for ftr in ["Actor", "InstrumentType", "Objective", "Resource", "Time"]:
-                token_level_labels = span_to_mhead_lbls(ftr, tokens, spans, label2id)
-                dataset[f"labels_{ftr}"].append(token_level_labels)
-    return Dataset.from_dict(dataset), list(label2id)
+                token_level_labels = span_to_mhead_lbls(ftr, tokens, spans)
+                datapoint[f"labels_{ftr}"] = token_level_labels
+            datapoints.append(datapoint)
+    # return pd.DataFrame(datapoints)
+    return Dataset.from_list(datapoints)
 
 def create_mhead_ds(pol_dir, dir_addr):
     '''
@@ -199,8 +185,6 @@ def create_mhead_ds(pol_dir, dir_addr):
     pol_df = df_loading(pol_dir)
     ds, ll = df_to_mhead_ds(pol_df)
     ds.save_to_disk(dir_addr)
-    with open(f"{dir_addr}/label_mapping.json", "w", encoding="utf-8") as f:
-        json.dump(ll, f, indent=4)
     print(f"Created dataset in {dir_addr}")
 
 ################################ Splitting ################################
@@ -226,11 +210,15 @@ def main():
     mhead_ds_addr = cwd+"/../inputs/mhead_ds"
     #create_mhead_ds(pol_dir, mhead_ds_addr)
     ### splitting
+    '''
     sghead_ds = load_from_disk(sghead_ds_addr)
-    create_dsdcts(sghead_ds, sghead_ds_addr+"dcts", [4,5])
+    create_dsdcts(sghead_ds, sghead_ds_addr+"dcts", list(range(3)))
     mhead_ds = load_from_disk(mhead_ds_addr)
-    create_dsdcts(mhead_ds, mhead_ds_addr+"dcts", [4,5])
-    
+    create_dsdcts(mhead_ds, mhead_ds_addr+"dcts", list(range(3)))
+    '''
+    df = df_loading(pol_dir)
+    label_set = extract_sghead_label_set(df)
+    print(label_set)
 
 if __name__=="__main__":
     main()

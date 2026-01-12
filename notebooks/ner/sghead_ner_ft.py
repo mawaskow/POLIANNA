@@ -2,125 +2,167 @@
 Normal token classification model training 
 '''
 import os
-from transformers import AutoTokenizer, AutoModelForTokenClassification, DataCollatorForTokenClassification, TrainingArguments, Trainer
+from transformers import AutoTokenizer, AutoModelForTokenClassification, get_linear_schedule_with_warmup
 from datasets import DatasetDict
 import evaluate
 import numpy as np
 import json
 import subprocess
 import time
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+import gc
 
 #############
 # functions #
 #############
 
-def sghead_tokenize_and_align_labels(examples, tokenizer):
-    # adapted from https://huggingface.co/docs/transformers/en/tasks/token_classification
-    tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True)
-    labels = []
-    for i, label in enumerate(examples[f"ner_tags"]):
-        word_ids = tokenized_inputs.word_ids(batch_index=i)  # Map tokens to their respective word.
-        previous_word_idx = None
-        label_ids = []
-        for word_idx in word_ids:  # Set the special tokens to -100.
-            if word_idx is None:
-                label_ids.append(-100)
-            elif word_idx != previous_word_idx:  # Only label the first token of a given word.
-                label_ids.append(label[word_idx])
-            else:
-                label_ids.append(-100)
-            previous_word_idx = word_idx
-        labels.append(label_ids)
-    tokenized_inputs["labels"] = labels
+def sghead_tokenize_and_align_labels(tokens, ner_tags, tokenizer, label2id, max_length=512):
+    tokenized_inputs = tokenizer(tokens, truncation=True, is_split_into_words=True, max_length=max_length, return_tensors=None)
+    word_ids = tokenized_inputs.word_ids()
+    previous_word_idx = None
+    label_ids = []
+    for word_idx in word_ids:
+        if word_idx is None:
+            label_ids.append(-100)
+        elif word_idx != previous_word_idx:
+            label_ids.append(label2id[ner_tags[word_idx]])
+        else:
+            label_ids.append(-100)
+        previous_word_idx = word_idx
+    tokenized_inputs["labels"] = label_ids
     return tokenized_inputs
 
-def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r):
-    '''
-    Docstring for finetune_sghead_model
-    
-    :param model_name: name of hf model to be used as tokenizer and base model for fine-tuning
-    :param label_list: list of labels in order (for conversion between BIO tags in the classes and ints)
-    :param model_save_addr: directory address where to save the model directories
-    :param dsdct_dir: directory address (sghead_dsdcts) where the datasetdictionary directories (dsdct_r{#}) are stored
-    :param r: which # run
-    '''
-    st = time.time()
-    # initialize tokenization of dataset
+class SgheadDataset(Dataset):
+    def __init__(self, hf_dataset, tokenizer, label2id, max_length=512):
+        self.dataset = hf_dataset
+        self.tokenizer = tokenizer
+        self.label2id = label2id
+        self.max_length = max_length
+    def __len__(self):
+        return len(self.dataset)
+    def __getitem__(self, idx):
+        sample = self.dataset[idx]
+        tokens = sample["tokens"]
+        ner_tags = sample["ner_tags"]
+        encoding = sghead_tokenize_and_align_labels(
+            tokens,
+            ner_tags,
+            self.tokenizer,
+            self.label2id,
+            self.max_length
+        )
+        return {
+            "input_ids": torch.tensor(encoding["input_ids"]),
+            "attention_mask": torch.tensor(encoding["attention_mask"]),
+            "labels": torch.tensor(encoding["labels"])
+        }
+
+def sghead_collate(batch, pad_token_id):
+    input_ids = [b["input_ids"] for b in batch]
+    attention_masks = [b["attention_mask"] for b in batch]
+    labels = [b["labels"] for b in batch]
+    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=pad_token_id)
+    attention_masks = pad_sequence(attention_masks, batch_first=True, padding_value=0)
+    labels = pad_sequence(labels, batch_first=True, padding_value=-100)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_masks,
+        "labels": labels
+    }
+
+def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r, params = None):
+    if not params:
+        params = {
+            "num_epochs": 10,
+            "lr": 3e-5,
+            "weight_decay": 0.01,
+            "batch_size":16
+        }
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    # tokenize dataset and initialize data collator
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     dataset_dict = DatasetDict.load_from_disk(f"{dsdct_dir}/dsdct_r{r}")
-    tokenized_dsdct = dataset_dict.map(sghead_tokenize_and_align_labels, fn_kwargs={"tokenizer": tokenizer}, batched=True)
-    data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
-    # get labels
+    train_dataset = SgheadDataset(dataset_dict["train"], tokenizer)
+    dev_dataset = SgheadDataset(dataset_dict["dev"], tokenizer)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=params["batch_size"],
+        shuffle=True,
+        collate_fn=lambda b: sghead_collate(b, tokenizer.pad_token_id)
+    )
+    dev_loader = DataLoader(
+        dev_dataset,
+        batch_size=params["batch_size"],
+        shuffle=False,
+        collate_fn=lambda b: sghead_collate(b, tokenizer.pad_token_id)
+    )
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     label2id = {l: i for i, l in enumerate(label_list)}
     id2label = {i: l for i, l in enumerate(label_list)}
-    # setup metrics calculation
-    seqeval = evaluate.load("seqeval")
-    metric_log = []
-    def compute_metrics(p):
-        # fxn from https://huggingface.co/docs/transformers/en/tasks/token_classification
-        predictions, labels = p
-        predictions = np.argmax(predictions, axis=2)
-        true_predictions = [
-            [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
-        ]
-        true_labels = [
-            [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
-        ]
-        results = seqeval.compute(predictions=true_predictions, references=true_labels)
-        return {
-            "precision": results["overall_precision"],
-            "recall": results["overall_recall"],
-            "f1": results["overall_f1"],
-            "accuracy": results["overall_accuracy"],
-        }
-    # load model
-    igmms = model_name == "dslim/bert-base-NER-uncased"
     model = AutoModelForTokenClassification.from_pretrained(
-        model_name, num_labels=len(label_list), id2label=id2label, label2id=label2id,
-        ignore_mismatched_sizes=igmms
+        model_name,
+        num_labels=len(label_list),
+        id2label=id2label,
+        label2id=label2id,
+        ignore_mismatched_sizes=(model_name == "dslim/bert-base-NER-uncased")
+    ).to(dev)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=params["lr"], weight_decay=params["weight_decay"])
+    num_training_steps = params["num_epochs"] * len(train_loader)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=0,
+        num_training_steps=num_training_steps
     )
-    print(model_name, "loaded.")
-    # define trainer
-    training_args = TrainingArguments(
-        output_dir=model_name.split("/")[-1],
-        learning_rate=3e-5,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
-        num_train_epochs=10,
-        weight_decay=0.01,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True
-    )
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_dsdct["train"],
-        eval_dataset=tokenized_dsdct["dev"],
-        processing_class=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics
-    )
-    # train
-    print("Training begin")
-    trainer.train()
-    trainer.save_model(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}")
-    # metrics
-    train_losses = [log["loss"] for log in trainer.state.log_history if "loss" in log]
-    eval_losses = [log["eval_loss"] for log in trainer.state.log_history if "eval_loss" in log]
-    metric_log.append({"train_loss":train_losses})
-    metric_log.append({"eval_loss": eval_losses})
-    metric_log.append({"training_time_min": round((time.time()-st)/60,2)})
+    model.train()
+    for epoch in range(params["num_epochs"]):
+        total_loss = 0.0
+        for batch in train_loader:
+            batch = {k: v.to(dev) for k, v in batch.items()}
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(**batch)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            total_loss += loss.item()
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1} | Train loss: {avg_loss:.4f}")
+    seqeval = evaluate.load("seqeval")
+    def evaluate_model(model, dataloader):
+        model.eval()
+        all_preds = []
+        all_labels = []
+        with torch.no_grad():
+            for batch in dataloader:
+                labels = batch["labels"]
+                batch = {k: v.to(dev) for k, v in batch.items()}
+                outputs = model(**batch)
+                logits = outputs.logits
+                predictions = torch.argmax(logits, dim=-1).cpu().numpy()
+                labels = labels.numpy()
+                for preds, labs in zip(predictions, labels):
+                    true_preds = []
+                    true_labs = []
+                    for p, l in zip(preds, labs):
+                        if l != -100:
+                            true_preds.append(id2label[p])
+                            true_labs.append(id2label[l])
+                    all_preds.append(true_preds)
+                    all_labels.append(true_labs)
+        return seqeval.compute(predictions=all_preds, references=all_labels)
+    metrics = evaluate_model(model, dev_loader)
+    save_path = f"{model_save_addr}/{model_name.split('/')[-1]}_{r}"
+    model.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
     with open(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}/metrics.json", "w", encoding="utf-8") as f:
-        json.dump(metric_log, f, ensure_ascii=False, indent=4)
+        json.dump(metrics, f, ensure_ascii=False, indent=4)
     # cleanup
     del model
-    del trainer
     del tokenizer
-    print(f"Trained {model_name} r{r}")
+    torch.cuda.empty_cache()
+    gc.collect()
 
 ########
 # main #
@@ -130,20 +172,20 @@ def main():
     cwd = os.getcwd()
     model_save_addr = cwd+"/../models/sghead"
     dsdct_dir = cwd+"/../inputs/sghead_dsdcts"
-    with open(cwd+"/../inputs/sghead_ds/label_mapping.json", "r", encoding="utf-8") as f:
-        label_list = json.load(f)
+    label_list = ['O', 'B-Actor', 'I-Actor', 'B-InstrumentType', 'I-InstrumentType', 'B-Objective', 'I-Objective', 'B-Resource', 'I-Resource', 'B-Time', 'I-Time']
     ########### one-off ###########
-    '''
+    
     model_name = "microsoft/deberta-v3-base"
-    r = 3
+    r = 0
     finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r)
+    ''''''
     '''
     ########### loop mode ###########
     #["microsoft/deberta-v3-base","FacebookAI/xlm-roberta-base","dslim/bert-base-NER-uncased"]
     st = time.time()
-    for model_name in ["dslim/bert-base-NER-uncased"]:
+    for model_name in ["microsoft/deberta-v3-base","FacebookAI/xlm-roberta-base","dslim/bert-base-NER-uncased"]:
         md_st = time.time()
-        for r in [3,4,5]:
+        for r in [0,1,2]:
             print(f"\n--- Starting run {model_name} r{r} ---")
             run_st = time.time()
             subprocess.run([
@@ -159,7 +201,7 @@ def main():
             time.sleep(2)
         print(f"\nAll r's of {model_name} done in {round((time.time()-md_st)/60,2)} min")
     print(f'\nAll models and runs done in {round((time.time()-st)/60,2)} min')
-    ''''''
+    '''
 
 if __name__=="__main__":
     main()
