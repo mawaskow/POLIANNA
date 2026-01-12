@@ -19,14 +19,16 @@ import tqdm
 # functions #
 #############
 
-def convert_numpy_to_python(obj):
+def convert_numpy_torch_to_python(obj):
     '''
     For converting our metrics dict to something json serializable
     '''
     if isinstance(obj, dict):
-        return {k: convert_numpy_to_python(v) for k, v in obj.items()}
+        return {k: convert_numpy_torch_to_python(v) for k, v in obj.items()}
     elif isinstance(obj, list):
-        return [convert_numpy_to_python(v) for v in obj]
+        return [convert_numpy_torch_to_python(v) for v in obj]
+    elif isinstance(obj, torch.Tensor):
+        return obj.item() if obj.numel() == 1 else obj.tolist()
     elif isinstance(obj, (np.integer, np.int32, np.int64)):
         return int(obj)
     elif isinstance(obj, (np.floating, np.float32, np.float64)):
@@ -131,7 +133,7 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
         num_labels=len(label_list),
         id2label=id2label,
         label2id=label2id,
-        ignore_mismatched_sizes=(model_name == "dslim/bert-base-NER-uncased")
+        ignore_mismatched_sizes= model_name == "dslim/bert-base-NER-uncased"
     ).to(dev)
     optimizer = torch.optim.AdamW(model.parameters(), lr=params["lr"], weight_decay=params["weight_decay"])
     num_training_steps = params["num_epochs"] * len(train_loader)
@@ -169,6 +171,7 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
     # adding early stopping
     best_eval_loss = float("inf")
     epochs_no_improvement = 0
+    model_epoch = 0
     for epoch in range(params["num_epochs"]):
         model.train()
         total_train_loss = 0.0
@@ -186,7 +189,7 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
         print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Eval Loss: {metrics['avg_eval_loss']:.4f} | Precision: {metrics['overall_precision']:.4f} | Recall: {metrics['overall_recall']:.4f} | F1: {metrics['overall_f1']:.4f}")
         if metrics['avg_eval_loss'] < best_eval_loss:
             best_eval_loss = metrics['avg_eval_loss']
-            metrics['final_epoch'] = epoch+1
+            model_epoch = epoch
             epochs_no_improvement = 0
             save_path = f"{model_save_addr}/{model_name.split('/')[-1]}_{r}"
             model.save_pretrained(save_path)
@@ -196,11 +199,12 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
             if epochs_no_improvement >= params['patience']:
                 print(f"Early stopping triggered after {epoch+1} epochs.")
                 break
+    metrics['epoch_saved'] = model_epoch
     metrics['time_min'] = round((time.time()-st)/60,2)
     print(metrics)
     with open(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}/params.json", "w", encoding="utf-8") as f:
         json.dump(params, f, ensure_ascii=False, indent=4)
-    metrics_clean = convert_numpy_to_python(metrics)
+    metrics_clean = convert_numpy_torch_to_python(metrics)
     with open(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}/metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics_clean, f, ensure_ascii=False, indent=4)
     # cleanup
@@ -220,10 +224,10 @@ def main():
     label_list = ['O', 'B-Actor', 'I-Actor', 'B-InstrumentType', 'I-InstrumentType', 'B-Objective', 'I-Objective', 'B-Resource', 'I-Resource', 'B-Time', 'I-Time']
     ########### one-off ###########
     '''
-    model_name = "microsoft/deberta-v3-base"
-    r = 1
+    model_name = "dslim/bert-base-NER-uncased"
+    r = 0
     params = {
-            "num_epochs": 3,
+            "num_epochs": 15,
             "lr": 3e-5,
             "weight_decay": 0.01,
             "batch_size":16,
@@ -236,7 +240,7 @@ def main():
     ########### loop mode ###########
     #["microsoft/deberta-v3-base","FacebookAI/xlm-roberta-base","dslim/bert-base-NER-uncased"]
     st = time.time()
-    for model_name in ["microsoft/deberta-v3-base","FacebookAI/xlm-roberta-base","dslim/bert-base-NER-uncased"]:
+    for model_name in ["dslim/bert-base-NER-uncased"]:
         md_st = time.time()
         for r in [0,1,2]:
             print(f"\n--- Starting run {model_name} r{r} ---")
