@@ -13,10 +13,26 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import gc
+import tqdm
 
 #############
 # functions #
 #############
+
+def convert_numpy_to_python(obj):
+    '''
+    For converting our metrics dict to something json serializable
+    '''
+    if isinstance(obj, dict):
+        return {k: convert_numpy_to_python(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_to_python(v) for v in obj]
+    elif isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    else:
+        return obj
 
 class SgheadDataset(Dataset):
     def __init__(self, hf_dataset, tokenizer, label2id, max_length=512):
@@ -77,7 +93,7 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
     :param model_save_addr: where to save model
     :param dsdct_dir: location of datasetdicts
     :param r: which dataset split dict to use
-    :param params: hyperparameter dict including num_epochs, lr, weight_decay, and batch_size
+    :param params: hyperparameter dict including num_epochs, lr, weight_decay, batch_size, num_warmup_steps, and patience
     '''
     st = time.time()
     if not params:
@@ -85,7 +101,9 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
             "num_epochs": 10,
             "lr": 3e-5,
             "weight_decay": 0.01,
-            "batch_size":16
+            "batch_size":16,
+            "num_warmup_steps":0,
+            "patience": 3
         }
     label2id = {l: i for i, l in enumerate(label_list)}
     id2label = {i: l for i, l in enumerate(label_list)}
@@ -119,35 +137,23 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
     num_training_steps = params["num_epochs"] * len(train_loader)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=0,
+        num_warmup_steps=params["num_warmup_steps"],
         num_training_steps=num_training_steps
     )
-    model.train()
-    for epoch in range(params["num_epochs"]):
-        total_loss = 0.0
-        for batch in train_loader:
-            batch = {k: v.to(dev) for k, v in batch.items()}
-            optimizer.zero_grad(set_to_none=True)
-            outputs = model(**batch)
-            loss = outputs.loss
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-            total_loss += loss.item()
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1} | Train loss: {avg_loss:.4f}")
     seqeval = evaluate.load("seqeval")
     def evaluate_model(model, dataloader):
         model.eval()
+        total_eval_loss = 0.0
         all_preds = []
         all_labels = []
         with torch.no_grad():
             for batch in dataloader:
-                labels = batch["labels"].cpu().numpy()
+                batch = {k: v.to(dev) for k, v in batch.items()}  # move everything, including labels
                 outputs = model(**batch)
+                total_eval_loss += outputs.loss.item()
                 logits = outputs.logits
                 predictions = torch.argmax(logits, dim=-1).cpu().numpy()
-                labels = labels.numpy()
+                labels = batch["labels"].cpu().numpy()
                 for preds, labs in zip(predictions, labels):
                     true_preds = []
                     true_labs = []
@@ -157,17 +163,46 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
                             true_labs.append(id2label[l])
                     all_preds.append(true_preds)
                     all_labels.append(true_labs)
-        return seqeval.compute(predictions=all_preds, references=all_labels)
-    metrics = evaluate_model(model, dev_loader)
-    save_path = f"{model_save_addr}/{model_name.split('/')[-1]}_{r}"
-    model.save_pretrained(save_path)
-    tokenizer.save_pretrained(save_path)
+        metrics = seqeval.compute(predictions=all_preds, references=all_labels)
+        metrics['avg_eval_loss'] = total_eval_loss / len(dataloader)
+        return metrics
+    # adding early stopping
+    best_eval_loss = float("inf")
+    epochs_no_improvement = 0
+    for epoch in range(params["num_epochs"]):
+        model.train()
+        total_train_loss = 0.0
+        for batch in tqdm.tqdm(train_loader):
+            batch = {k: v.to(dev) for k, v in batch.items()}
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(**batch)
+            train_loss = outputs.loss
+            train_loss.backward()
+            optimizer.step()
+            scheduler.step()
+            total_train_loss += train_loss.item()
+        avg_train_loss = total_train_loss / len(train_loader)
+        metrics = evaluate_model(model, dev_loader)
+        print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Eval Loss: {metrics['avg_eval_loss']:.4f} | Precision: {metrics['overall_precision']:.4f} | Recall: {metrics['overall_recall']:.4f} | F1: {metrics['overall_f1']:.4f}")
+        if metrics['avg_eval_loss'] < best_eval_loss:
+            best_eval_loss = metrics['avg_eval_loss']
+            metrics['final_epoch'] = epoch+1
+            epochs_no_improvement = 0
+            save_path = f"{model_save_addr}/{model_name.split('/')[-1]}_{r}"
+            model.save_pretrained(save_path)
+            tokenizer.save_pretrained(save_path)
+        else:
+            epochs_no_improvement += 1
+            if epochs_no_improvement >= params['patience']:
+                print(f"Early stopping triggered after {epoch+1} epochs.")
+                break
     metrics['time_min'] = round((time.time()-st)/60,2)
     print(metrics)
     with open(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}/params.json", "w", encoding="utf-8") as f:
         json.dump(params, f, ensure_ascii=False, indent=4)
-    #with open(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}/metrics.json", "w", encoding="utf-8") as f:
-    #    json.dump(metrics, f, ensure_ascii=False, indent=4)
+    metrics_clean = convert_numpy_to_python(metrics)
+    with open(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}/metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics_clean, f, ensure_ascii=False, indent=4)
     # cleanup
     del model
     del tokenizer
@@ -184,18 +219,20 @@ def main():
     dsdct_dir = cwd+"/../inputs/sghead_dsdcts"
     label_list = ['O', 'B-Actor', 'I-Actor', 'B-InstrumentType', 'I-InstrumentType', 'B-Objective', 'I-Objective', 'B-Resource', 'I-Resource', 'B-Time', 'I-Time']
     ########### one-off ###########
-    
+    '''
     model_name = "microsoft/deberta-v3-base"
-    r = 0
+    r = 1
     params = {
-            "num_epochs": 10,
+            "num_epochs": 3,
             "lr": 3e-5,
             "weight_decay": 0.01,
-            "batch_size":16
+            "batch_size":16,
+            "num_warmup_steps":0,
+            "patience": 3
         }
     finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r, params)
-    ''''''
     '''
+    
     ########### loop mode ###########
     #["microsoft/deberta-v3-base","FacebookAI/xlm-roberta-base","dslim/bert-base-NER-uncased"]
     st = time.time()
@@ -217,7 +254,7 @@ def main():
             time.sleep(2)
         print(f"\nAll r's of {model_name} done in {round((time.time()-md_st)/60,2)} min")
     print(f'\nAll models and runs done in {round((time.time()-st)/60,2)} min')
-    '''
+    ''''''
 
 if __name__=="__main__":
     main()
