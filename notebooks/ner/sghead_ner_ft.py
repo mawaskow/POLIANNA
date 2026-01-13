@@ -150,7 +150,7 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
         all_labels = []
         with torch.no_grad():
             for batch in dataloader:
-                batch = {k: v.to(dev) for k, v in batch.items()}  # move everything, including labels
+                batch = {k: v.to(dev) for k, v in batch.items()}
                 outputs = model(**batch)
                 total_eval_loss += outputs.loss.item()
                 logits = outputs.logits

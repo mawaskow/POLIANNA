@@ -116,8 +116,8 @@ class MheadTokenClassifier(nn.Module):
             "num_labels": self.num_labels,
             "params": params,
             "dropout": params['dropout'],
-            "class_weights": self.class_wgt_dct,#{k: v.tolist() for k, v in (class_weights or {}).items()},
-            "head_weights": self.head_wgt_dct
+            "class_weights": self.class_weights,#{k: v.tolist() for k, v in (class_weights or {}).items()},
+            "head_weights": self.head_weights
         }
         with open(os.path.join(save_dir, "config.json"), "w") as f:
             json.dump(config, f, indent=4)
@@ -310,6 +310,7 @@ def main():
     cwd = os.getcwd()
     model_save_addr = cwd+"/../models/mhead"
     dsdct_dir = cwd+"/../inputs/mhead_dsdcts"
+    '''
     ########### one-off ###########
     params = {
             "num_epochs": 15,
@@ -323,13 +324,13 @@ def main():
     model_name = "microsoft/deberta-v3-base"
     r = 0
     finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r, params)
-    ''''''
-    ########### loop mode ###########
     '''
+    ########### loop mode ###########
+    
     st = time.time()
     for model_name in ["microsoft/deberta-v3-base","FacebookAI/xlm-roberta-base","dslim/bert-base-NER-uncased"]:
         md_st = time.time()
-        for r in [3,4,5]:
+        for r in list(range(3)):
             print(f"\n--- Starting run {model_name} r{r} ---")
             run_st = time.time()
             subprocess.run([
@@ -345,7 +346,7 @@ def main():
             time.sleep(2)
         print(f"\nAll r's of {model_name} done in {round((time.time()-md_st)/60,2)} min")
     print(f'\nAll models and runs done in {round((time.time()-st)/60,2)} min')
-    '''
+    ''''''
 
 if __name__=="__main__":
     main()

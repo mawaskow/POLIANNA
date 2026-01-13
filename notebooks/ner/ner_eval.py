@@ -13,15 +13,57 @@ import json
 from transformers import DataCollatorForTokenClassification
 from torch.utils.data import DataLoader
 import pandas as pd
-from sghead_ner_ft import sghead_tokenize_and_align_labels
-from mhead_ner_ft import mhead_tokenize_and_align_labels, MultiHeadTokenConfig, MultiHeadTokClass
 import numpy as np
 from sklearn.metrics import f1_score, classification_report
 from collections import Counter
+from sghead_ner_ft import SgheadDataset, sghead_collate
+from mhead_ner_ft import MheadDataset, mhead_collate
 
 #############
 # functions #
 #############
+
+def sghead_evaluate_model(model, dataloader, dev, id2label):
+    seqeval = evaluate.load("seqeval")
+    model.eval()
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = {k: v.to(dev) for k, v in batch.items()}  # move everything, including labels
+            outputs = model(**batch)
+            logits = outputs.logits
+            predictions = torch.argmax(logits, dim=-1).cpu().numpy()
+            labels = batch["labels"].cpu().numpy()
+            for preds, labs in zip(predictions, labels):
+                true_preds = []
+                true_labs = []
+                for p, l in zip(preds, labs):
+                    if l != -100:
+                        true_preds.append(id2label[p])
+                        true_labs.append(id2label[l])
+                all_preds.append(true_preds)
+                all_labels.append(true_labs)
+    metrics = seqeval.compute(predictions=all_preds, references=all_labels)
+    return metrics
+
+def sghead_torchpreds(model_name, label_list, model_save_addr, dsdct_dir, r, batch_size=16):
+    model_addr = f"{model_save_addr}/{model_name.split('/')[-1]}_{r}"
+    label2id = {l: i for i, l in enumerate(label_list)}
+    id2label = {i: l for i, l in enumerate(label_list)}
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    dataset_dict = DatasetDict.load_from_disk(f"{dsdct_dir}/dsdct_r{r}")
+    test_dataset = SgheadDataset(dataset_dict["train"], tokenizer, label2id)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=lambda b: sghead_collate(b, tokenizer.pad_token_id)
+    )
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModelForTokenClassification.from_pretrained(model_addr).to(dev)
+    metrics = sghead_evaluate_model(model, test_loader, dev, id2label)
+    return metrics
 
 ############################## SGHEAD SEQEVAL ##############################
 
@@ -41,7 +83,7 @@ def sghead_getpreds(model_name, label_list, model_save_addr, dsdct_dir, r):
     dataset_dict = DatasetDict.load_from_disk(f"{dsdct_dir}/dsdct_r{r}")
     model_tt = AutoModelForTokenClassification.from_pretrained(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}").to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenized_test = dataset_dict["test"].map(sghead_tokenize_and_align_labels, fn_kwargs={"tokenizer": tokenizer}, batched=True)
+    tokenized_test = dataset_dict["test"]#.map(sghead_tokenize_and_align_labels, fn_kwargs={"tokenizer": tokenizer}, batched=True)
     # setting now before torch conversion, saving for later
     all_inputids = [tokenized_test["input_ids"][i] for i in range(len(tokenized_test["input_ids"]))]
     tokenized_test.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
@@ -143,7 +185,7 @@ def mhead_getpreds(model_name, model_save_addr, dsdct_dir, r):
     # prepare dataset
     dataset_dict = DatasetDict.load_from_disk(f"{dsdct_dir}/dsdct_r{r}")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenized_test = dataset_dict["test"].map(mhead_tokenize_and_align_labels, fn_kwargs={"tokenizer": tokenizer}, batched=True)
+    tokenized_test = dataset_dict["test"]#.map(mhead_tokenize_and_align_labels, fn_kwargs={"tokenizer": tokenizer}, batched=True)
     # setting now before torch conversion, saving for later
     all_inputids = [tokenized_test["input_ids"][i] for i in range(len(tokenized_test["input_ids"]))]
     tokenized_test.set_format(type="torch", columns=["input_ids", "attention_mask"]+label_cols)
@@ -154,8 +196,8 @@ def mhead_getpreds(model_name, model_save_addr, dsdct_dir, r):
     all_preds = {name.replace("labels_",""): [] for name in label_cols}
     all_labels = {name.replace("labels_",""): [] for name in label_cols}
     # model setup
-    config = MultiHeadTokenConfig.from_pretrained(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}")
-    model_tt = MultiHeadTokClass(config).to(device)
+    config = 0#MultiHeadTokenConfig.from_pretrained(f"{model_save_addr}/{model_name.split('/')[-1]}_{r}")
+    model_tt = 0#MultiHeadTokClass(config).to(device)
     model_tt.eval() # disable dropout bc we're just doing inference
     with torch.no_grad(): # also bc we're just doing inference
         for batch in dataloader:
@@ -469,6 +511,13 @@ def main():
     sghead_models_dir = cwd+"/../models/sghead"
     mhead_dsdcts_dir = cwd+"/../inputs/mhead_dsdcts"
     mhead_models_dir = cwd+"/../models/mhead"
+    label_list = ['O', 'B-Actor', 'I-Actor', 'B-InstrumentType', 'I-InstrumentType', 'B-Objective', 'I-Objective', 'B-Resource', 'I-Resource', 'B-Time', 'I-Time']
+
+    model_name = "FacebookAI/xlm-roberta-base"
+    r = 0
+    metrics = sghead_torchpreds(model_name, label_list, sghead_models_dir, sghead_dsdcts_dir, r, batch_size=16)
+    print(metrics)
+    '''
     with open(cwd+"/../inputs/sghead_ds/label_mapping.json", "r", encoding="utf-8") as f:
         label_list = json.load(f)
     #
@@ -477,14 +526,14 @@ def main():
     #get_sghead_seqeval(model_name, label_list, sghead_models_dir, sghead_dsdcts_dir, r, results_dir+"/sghead")
     get_mhead_tokf1(model_name, mhead_models_dir, mhead_dsdcts_dir, r, results_dir+"/mhead")
     #visualize_run_mhead_tokf1_results("mhead", "tokf1", model_name, r, results_dir, idas=[0,1,2])
-    '''
+    
     for model_name in ["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"]:
         for r in [3,4,5]:#[0,1,2]:
             print(f"\n{model_name} {r}")
             #get_sghead_seqeval(model_name, label_list, sghead_models_dir, sghead_dsdcts_dir, r, results_dir+"/sghead")
             get_mhead_tokf1(model_name, mhead_models_dir, mhead_dsdcts_dir, r, results_dir+"/mhead")
             get_mhead_seqeval(model_name, r, results_dir+"/mhead")
-    '''
+    
     #results_dict = consol_sghead_seqeval_results(model_names=["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"], r_vals=[0,1,2,3,4,5], results_dir=results_dir+"/sghead")
     results_dict = consol_mhead_tokf1_results(model_names=["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"], r_vals=[0,1,2,3,4,5], results_dir=results_dir+"/mhead")
     #results_dict = consol_mhead_seqeval_results(model_names=["microsoft/deberta-v3-base", "dslim/bert-base-NER-uncased", "FacebookAI/xlm-roberta-base"], r_vals=[0,1,2], results_dir=results_dir+"/mhead")
@@ -496,7 +545,7 @@ def main():
     #df_vis_consol_sghead_seqeval(results_dict)
 
     #shortestvis(results_dict)
-    shortestvis_tokf1(results_dict)
+    shortestvis_tokf1(results_dict)'''
     ''''''
     # postprocessing
     #visualize_run_results("sghead", "seqeval", model_name, r, results_dir, [0,2])
