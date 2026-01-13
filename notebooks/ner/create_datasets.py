@@ -183,7 +183,7 @@ def create_mhead_ds(pol_dir, dir_addr):
     :param dir_addr: directory where to save dataset
     '''
     pol_df = df_loading(pol_dir)
-    ds, ll = df_to_mhead_ds(pol_df)
+    ds = df_to_mhead_ds(pol_df)
     ds.save_to_disk(dir_addr)
     print(f"Created dataset in {dir_addr}")
 
@@ -206,19 +206,19 @@ def main():
     pol_dir = cwd+"/../../src/d01_data"
     ### creating
     sghead_ds_addr = cwd+"/../inputs/sghead_ds"
-    #create_sghead_ds(pol_dir, sghead_ds_addr)
+    create_sghead_ds(pol_dir, sghead_ds_addr)
     mhead_ds_addr = cwd+"/../inputs/mhead_ds"
-    #create_mhead_ds(pol_dir, mhead_ds_addr)
+    create_mhead_ds(pol_dir, mhead_ds_addr)
     ### splitting
-    '''
+    
     sghead_ds = load_from_disk(sghead_ds_addr)
-    create_dsdcts(sghead_ds, sghead_ds_addr+"dcts", list(range(3)))
+    create_dsdcts(sghead_ds, sghead_ds_addr+"dcts", list(range(5)))
     mhead_ds = load_from_disk(mhead_ds_addr)
-    create_dsdcts(mhead_ds, mhead_ds_addr+"dcts", list(range(3)))
+    create_dsdcts(mhead_ds, mhead_ds_addr+"dcts", list(range(5)))
     '''
     df = df_loading(pol_dir)
     label_set = extract_sghead_label_set(df)
     print(label_set)
-
+    '''
 if __name__=="__main__":
     main()

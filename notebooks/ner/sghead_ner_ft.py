@@ -240,9 +240,9 @@ def main():
     ########### loop mode ###########
     #["microsoft/deberta-v3-base","FacebookAI/xlm-roberta-base","dslim/bert-base-NER-uncased"]
     st = time.time()
-    for model_name in ["dslim/bert-base-NER-uncased"]:
+    for model_name in ["microsoft/deberta-v3-base","FacebookAI/xlm-roberta-base","dslim/bert-base-NER-uncased"]:
         md_st = time.time()
-        for r in [0,1,2]:
+        for r in list(range(5)):
             print(f"\n--- Starting run {model_name} r{r} ---")
             run_st = time.time()
             subprocess.run([
