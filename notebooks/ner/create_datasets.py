@@ -204,21 +204,17 @@ def create_dsdcts(dataset, dsdct_dir, r_list=[0]):
 def main():
     cwd = os.getcwd()
     pol_dir = cwd+"/../../src/d01_data"
-    ### creating
+    ### creates whole sghead and mhead datasets from original POLIANNA database
     sghead_ds_addr = cwd+"/../inputs/sghead_ds"
-    create_sghead_ds(pol_dir, sghead_ds_addr)
+    #create_sghead_ds(pol_dir, sghead_ds_addr)
     mhead_ds_addr = cwd+"/../inputs/mhead_ds"
-    create_mhead_ds(pol_dir, mhead_ds_addr)
-    ### splitting
-    
-    sghead_ds = load_from_disk(sghead_ds_addr)
-    create_dsdcts(sghead_ds, sghead_ds_addr+"dcts", list(range(5)))
+    #create_mhead_ds(pol_dir, mhead_ds_addr)
+
+    ### creates the dataset dictionaries for each r split from the sghead and mhead datasets
+    #sghead_ds = load_from_disk(sghead_ds_addr)
+    #create_dsdcts(sghead_ds, sghead_ds_addr+"dcts", list(range(3)))
     mhead_ds = load_from_disk(mhead_ds_addr)
-    create_dsdcts(mhead_ds, mhead_ds_addr+"dcts", list(range(5)))
-    '''
-    df = df_loading(pol_dir)
-    label_set = extract_sghead_label_set(df)
-    print(label_set)
-    '''
+    create_dsdcts(mhead_ds, mhead_ds_addr+"dcts", list(range(3,4)))
+
 if __name__=="__main__":
     main()

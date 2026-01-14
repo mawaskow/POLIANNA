@@ -16,54 +16,71 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics import f1_score, classification_report
 from collections import Counter
-from sghead_ner_ft import SgheadDataset, sghead_collate
-from mhead_ner_ft import MheadDataset, mhead_collate
+from sghead_ner_ft import SgheadDataset, sghead_collate, sghead_evaluate_model
+from mhead_ner_ft import MheadDataset, MheadTokenClassifier, mhead_collate, mhead_evaluate_model
 
 #############
 # functions #
 #############
 
-def sghead_evaluate_model(model, dataloader, dev, id2label):
-    seqeval = evaluate.load("seqeval")
-    model.eval()
-    all_preds = []
-    all_labels = []
-    with torch.no_grad():
-        for batch in dataloader:
-            batch = {k: v.to(dev) for k, v in batch.items()}  # move everything, including labels
-            outputs = model(**batch)
-            logits = outputs.logits
-            predictions = torch.argmax(logits, dim=-1).cpu().numpy()
-            labels = batch["labels"].cpu().numpy()
-            for preds, labs in zip(predictions, labels):
-                true_preds = []
-                true_labs = []
-                for p, l in zip(preds, labs):
-                    if l != -100:
-                        true_preds.append(id2label[p])
-                        true_labs.append(id2label[l])
-                all_preds.append(true_preds)
-                all_labels.append(true_labs)
-    metrics = seqeval.compute(predictions=all_preds, references=all_labels)
-    return metrics
+def extract_results(raw_res_dct, mode="sghead", eval_type="seqeval"):
+    results_dict = {}
+    results_dict["Overall"] = {}
+    for ftr in ["Actor", "InstrumentType", "Objective", "Resource", "Time"]:
+        results_dict[ftr] = {}
+    if eval_type == "seqeval":
+        if mode =="sghead":
+            for k in list(raw_res_dct):
+                if k[:4]=="over":
+                    x, metric = k.split("_")
+                    results_dict['Overall'][metric]=float(raw_res_dct[k])
+                else:
+                    for mtr in list(raw_res_dct[k]):
+                        results_dict[k][mtr]=float(raw_res_dct[k][mtr])
+        elif mode == "mhead":
+            for k in list(raw_res_dct):
+                if k[:4]=="over":
+                    pass
+                else:
+                    for mtr in list(raw_res_dct[k]):
+                        results_dict[k][mtr]=float(raw_res_dct[k][mtr])
+    return results_dict
 
-def sghead_torchpreds(model_name, label_list, model_save_addr, dsdct_dir, r, batch_size=16):
+def evaluate_model(mode, model_name, model_save_addr, dsdct_dir, r, batch_size=16, dropout=0.1):
+    if mode == "sghead":
+        label_list = ['O', 'B-Actor', 'I-Actor', 'B-InstrumentType', 'I-InstrumentType', 'B-Objective', 'I-Objective', 'B-Resource', 'I-Resource', 'B-Time', 'I-Time']
+    elif mode == "mhead":
+        label_list = ["O","B","I"]
+        head_lst = ["Actor", "InstrumentType", "Objective", "Resource", "Time"]
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_addr = f"{model_save_addr}/{model_name.split('/')[-1]}_{r}"
     label2id = {l: i for i, l in enumerate(label_list)}
     id2label = {i: l for i, l in enumerate(label_list)}
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     dataset_dict = DatasetDict.load_from_disk(f"{dsdct_dir}/dsdct_r{r}")
-    test_dataset = SgheadDataset(dataset_dict["train"], tokenizer, label2id)
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=lambda b: sghead_collate(b, tokenizer.pad_token_id)
-    )
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AutoModelForTokenClassification.from_pretrained(model_addr).to(dev)
-    metrics = sghead_evaluate_model(model, test_loader, dev, id2label)
-    return metrics
+    if mode == "sghead":
+        test_dataset = SgheadDataset(dataset_dict["train"], tokenizer, label2id)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=lambda b: sghead_collate(b, tokenizer.pad_token_id)
+        )
+        model = AutoModelForTokenClassification.from_pretrained(model_addr).to(dev)
+        metrics, preds, reals = sghead_evaluate_model(model, test_loader, dev, id2label, return_rnp=True)
+    elif mode == "mhead":
+        test_dataset = MheadDataset(dataset_dict["train"], tokenizer, label2id)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=lambda b: mhead_collate(b, tokenizer.pad_token_id)
+        )
+        model = MheadTokenClassifier(model_name, head_lst, dropout = dropout).to(dev)
+        model.load_state_dict(torch.load(model_addr+"/model.pt", weights_only=True))
+        model.eval()
+        metrics, preds, reals = mhead_evaluate_model(model, test_loader, dev, id2label, return_rnp=True)
+    return metrics, preds, reals
 
 ############################## SGHEAD SEQEVAL ##############################
 
@@ -514,9 +531,23 @@ def main():
     label_list = ['O', 'B-Actor', 'I-Actor', 'B-InstrumentType', 'I-InstrumentType', 'B-Objective', 'I-Objective', 'B-Resource', 'I-Resource', 'B-Time', 'I-Time']
 
     model_name = "FacebookAI/xlm-roberta-base"
-    r = 0
-    metrics = sghead_torchpreds(model_name, label_list, sghead_models_dir, sghead_dsdcts_dir, r, batch_size=16)
-    print(metrics)
+    r = 1
+    metrics, preds, reals = evaluate_model("sghead", model_name, sghead_models_dir, sghead_dsdcts_dir, r, batch_size=16)
+    print("\n", metrics)
+    for i in range(20):
+        print(preds[0][i], reals[0][i])
+    metrics, preds, reals = evaluate_model("mhead", model_name, mhead_models_dir, mhead_dsdcts_dir, r)
+    print("\n", metrics)
+    for head in list(preds):
+        print(head)
+        for i in range(20):
+            print(preds[head][0][0][i], reals[head][0][0][i])
+    #print(metrics)
+    #cult_metr = extract_results(metrics, "sghead", "seqeval")
+    metrics = {'Actor': {'_': {'precision': 0.8, 'recall': 0.8, 'f1': 0.8000000000000002, 'number': 120}, 'overall_precision': 0.8, 'overall_recall': 0.8, 'overall_f1': 0.8000000000000002, 'overall_accuracy': 0.986378442404501}, 'InstrumentType': {'_': {'precision': 0.5306122448979592, 'recall': 0.2549019607843137, 'f1': 0.3443708609271523, 'number': 102}, 'overall_precision': 0.5306122448979592, 'overall_recall': 0.2549019607843137, 'overall_f1': 0.3443708609271523, 'overall_accuracy': 0.9452176488007107}, 'Objective': {'_': {'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'number': 15}, 'overall_precision': 0.0, 'overall_recall': 0.0, 'overall_f1': 0.0, 'overall_accuracy': 0.9700917974533609}, 'Resource': {'_': {'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'number': 27}, 'overall_precision': 0.0, 'overall_recall': 0.0, 'overall_f1': 0.0, 'overall_accuracy': 0.9878590464909683}, 'Time': {'_': {'precision': 0.07692307692307693, 'recall': 0.0625, 'f1': 0.06896551724137931, 'number': 16}, 'overall_precision': 0.07692307692307693, 'overall_recall': 0.0625, 'overall_f1': 0.06896551724137931, 'overall_accuracy': 0.9813443885105123}, 'avg_eval_loss': 0.452874297897021}
+    #cult_metr = extract_results(metrics, "mhead", "seqeval")
+    print("\n")
+    #print(cult_metr)
     '''
     with open(cwd+"/../inputs/sghead_ds/label_mapping.json", "r", encoding="utf-8") as f:
         label_list = json.load(f)

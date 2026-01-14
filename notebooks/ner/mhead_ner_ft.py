@@ -170,6 +170,47 @@ def mhead_collate(batch, pad_token_id):
     }
     return batch_return
 
+def mhead_evaluate_model(model, dataloader, dev, id2label, return_rnp = False):
+    seqeval = evaluate.load("seqeval")
+    model.eval()
+    meta_metrics = {}
+    total_eval_loss = 0.0
+    if return_rnp:
+        heads = ["Actor", "InstrumentType", "Objective", "Resource", "Time"]
+        pred_coll = {name: [] for name in heads}
+        real_coll = {name: [] for name in heads}
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = {
+                "input_ids": batch["input_ids"].to(dev),
+                "attention_mask": batch["attention_mask"].to(dev),
+                "labels": {k: v.to(dev) for k, v in batch['labels'].items()}
+            }
+            loss, logits = model(**batch)
+            total_eval_loss += loss.item()
+            predictions= {head: torch.argmax(logits[head], dim=-1).cpu().numpy() for head in logits}
+            labels = {head: batch["labels"][head].cpu().numpy() for head in batch["labels"]}
+            for head in predictions:
+                head_preds =[]
+                head_labels = []
+                for preds, labs in zip(predictions[head], labels[head]):
+                    true_preds = []
+                    true_labs = []
+                    for p, l in zip(preds, labs):
+                        if l != -100:
+                            true_preds.append(id2label[p])
+                            true_labs.append(id2label[l])
+                    head_preds.append(true_preds)
+                    head_labels.append(true_labs)
+                meta_metrics[head] = seqeval.compute(predictions=head_preds, references=head_labels)
+                if return_rnp:
+                    pred_coll[head].append(head_preds)
+                    real_coll[head].append(head_labels)
+    meta_metrics['avg_eval_loss'] = total_eval_loss / len(dataloader)
+    if return_rnp:
+        return meta_metrics, pred_coll, real_coll
+    return meta_metrics
+
 def finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r, params):
     '''
     Docstring for finetune_mhead_model
@@ -222,37 +263,6 @@ def finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r, params):
         num_warmup_steps=params["num_warmup_steps"],
         num_training_steps=num_training_steps
     )
-    seqeval = evaluate.load("seqeval")
-    def evaluate_model(model, dataloader):
-        model.eval()
-        meta_metrics = {}
-        total_eval_loss = 0.0
-        with torch.no_grad():
-            for batch in dataloader:
-                batch = {
-                    "input_ids": batch["input_ids"].to(dev),
-                    "attention_mask": batch["attention_mask"].to(dev),
-                    "labels": {k: v.to(dev) for k, v in batch['labels'].items()}
-                }
-                loss, logits = model(**batch)
-                total_eval_loss += loss.item()
-                predictions= {head: torch.argmax(logits[head], dim=-1).cpu().numpy() for head in logits}
-                labels = {head: batch["labels"][head].cpu().numpy() for head in batch["labels"]}
-                for head in predictions:
-                    head_preds =[]
-                    head_labels = []
-                    for preds, labs in zip(predictions[head], labels[head]):
-                        true_preds = []
-                        true_labs = []
-                        for p, l in zip(preds, labs):
-                            if l != -100:
-                                true_preds.append(id2label[p])
-                                true_labs.append(id2label[l])
-                        head_preds.append(true_preds)
-                        head_labels.append(true_labs)
-                    meta_metrics[head] = seqeval.compute(predictions=head_preds, references=head_labels)
-        meta_metrics['avg_eval_loss'] = total_eval_loss / len(dataloader)
-        return meta_metrics
     # adding early stopping
     best_eval_loss = float("inf")
     epochs_no_improvement = 0
@@ -278,7 +288,7 @@ def finetune_mhead_model(model_name, model_save_addr, dsdct_dir, r, params):
             scheduler.step()
             total_train_loss += train_loss.item()
         avg_train_loss = total_train_loss / len(train_loader)
-        metrics = evaluate_model(model, dev_loader)
+        metrics = mhead_evaluate_model(model, dev_loader, dev, id2label)
         print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Eval Loss: {metrics['avg_eval_loss']:.4f}")
         if metrics['avg_eval_loss'] < best_eval_loss:
             best_eval_loss = metrics['avg_eval_loss']

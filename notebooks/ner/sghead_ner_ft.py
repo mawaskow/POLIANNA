@@ -86,6 +86,35 @@ def sghead_collate(batch, pad_token_id):
         "labels": labels
     }
 
+def sghead_evaluate_model(model, dataloader, dev, id2label, return_rnp = False):
+        seqeval = evaluate.load("seqeval")
+        model.eval()
+        total_eval_loss = 0.0
+        all_preds = []
+        all_labels = []
+        with torch.no_grad():
+            for batch in dataloader:
+                batch = {k: v.to(dev) for k, v in batch.items()}
+                outputs = model(**batch)
+                total_eval_loss += outputs.loss.item()
+                logits = outputs.logits
+                predictions = torch.argmax(logits, dim=-1).cpu().numpy()
+                labels = batch["labels"].cpu().numpy()
+                for preds, labs in zip(predictions, labels):
+                    true_preds = []
+                    true_labs = []
+                    for p, l in zip(preds, labs):
+                        if l != -100:
+                            true_preds.append(id2label[p])
+                            true_labs.append(id2label[l])
+                    all_preds.append(true_preds)
+                    all_labels.append(true_labs)
+        metrics = seqeval.compute(predictions=all_preds, references=all_labels)
+        metrics['avg_eval_loss'] = total_eval_loss / len(dataloader)
+        if return_rnp:
+            return metrics, all_preds, all_labels
+        return metrics
+
 def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r, params = None):
     '''
     Docstring for finetune_sghead_model
@@ -142,32 +171,6 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
         num_warmup_steps=params["num_warmup_steps"],
         num_training_steps=num_training_steps
     )
-    seqeval = evaluate.load("seqeval")
-    def evaluate_model(model, dataloader):
-        model.eval()
-        total_eval_loss = 0.0
-        all_preds = []
-        all_labels = []
-        with torch.no_grad():
-            for batch in dataloader:
-                batch = {k: v.to(dev) for k, v in batch.items()}
-                outputs = model(**batch)
-                total_eval_loss += outputs.loss.item()
-                logits = outputs.logits
-                predictions = torch.argmax(logits, dim=-1).cpu().numpy()
-                labels = batch["labels"].cpu().numpy()
-                for preds, labs in zip(predictions, labels):
-                    true_preds = []
-                    true_labs = []
-                    for p, l in zip(preds, labs):
-                        if l != -100:
-                            true_preds.append(id2label[p])
-                            true_labs.append(id2label[l])
-                    all_preds.append(true_preds)
-                    all_labels.append(true_labs)
-        metrics = seqeval.compute(predictions=all_preds, references=all_labels)
-        metrics['avg_eval_loss'] = total_eval_loss / len(dataloader)
-        return metrics
     # adding early stopping
     best_eval_loss = float("inf")
     epochs_no_improvement = 0
@@ -185,7 +188,7 @@ def finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r,
             scheduler.step()
             total_train_loss += train_loss.item()
         avg_train_loss = total_train_loss / len(train_loader)
-        metrics = evaluate_model(model, dev_loader)
+        metrics = sghead_evaluate_model(model, dev_loader, dev, id2label)
         print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Eval Loss: {metrics['avg_eval_loss']:.4f} | Precision: {metrics['overall_precision']:.4f} | Recall: {metrics['overall_recall']:.4f} | F1: {metrics['overall_f1']:.4f}")
         if metrics['avg_eval_loss'] < best_eval_loss:
             best_eval_loss = metrics['avg_eval_loss']
@@ -223,8 +226,8 @@ def main():
     dsdct_dir = cwd+"/../inputs/sghead_dsdcts"
     label_list = ['O', 'B-Actor', 'I-Actor', 'B-InstrumentType', 'I-InstrumentType', 'B-Objective', 'I-Objective', 'B-Resource', 'I-Resource', 'B-Time', 'I-Time']
     ########### one-off ###########
-    '''
-    model_name = "dslim/bert-base-NER-uncased"
+    
+    model_name = "FacebookAI/xlm-roberta-base"
     r = 0
     params = {
             "num_epochs": 15,
@@ -235,8 +238,8 @@ def main():
             "patience": 3
         }
     finetune_sghead_model(model_name, label_list, model_save_addr, dsdct_dir, r, params)
+    ''''''
     '''
-    
     ########### loop mode ###########
     #["microsoft/deberta-v3-base","FacebookAI/xlm-roberta-base","dslim/bert-base-NER-uncased"]
     st = time.time()
@@ -258,7 +261,7 @@ def main():
             time.sleep(2)
         print(f"\nAll r's of {model_name} done in {round((time.time()-md_st)/60,2)} min")
     print(f'\nAll models and runs done in {round((time.time()-st)/60,2)} min')
-    ''''''
+    '''
 
 if __name__=="__main__":
     main()
